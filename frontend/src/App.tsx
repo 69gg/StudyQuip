@@ -11,6 +11,7 @@ import {
 import { api, post, setCsrf } from "./api";
 import BrandMark from "./BrandMark";
 import ThemeSwitch, { type Theme } from "./ThemeSwitch";
+import { JobsProvider } from "./JobProgress";
 import type { Book, Subject } from "./types";
 import { Button, Field, NoticeContext, State, useRemote } from "./ui";
 const Home = lazy(() => import("./Home"));
@@ -152,7 +153,9 @@ function Workspace() {
           </aside>
           <main className="workspace">
             <Suspense fallback={<div className="loading">正在载入…</div>}>
-              <WorkspaceContent key={tab} tab={tab} />
+              <JobsProvider>
+                <WorkspaceContent key={tab} tab={tab} />
+              </JobsProvider>
             </Suspense>
           </main>
         </div>

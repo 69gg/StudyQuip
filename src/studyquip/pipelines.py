@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -280,7 +281,7 @@ class PipelineContext:
         checkpoint_from_result: Callable[[Any], Json] | None = None,
     ) -> Any:
         async with self._save_lock:
-            next_data = {**self.data, **(patch or {})}
+            next_data = {**self.data, **(patch or {}), "last_activity_at": time.time()}
             result: list[Any] = []
 
             def fenced(conn: Connection) -> None:
@@ -309,7 +310,7 @@ class PipelineContext:
         async def save(value: Json) -> None:
             async with self._save_lock:
                 stages = {**self.data.get("stages", {}), key: copy.deepcopy(value)}
-                patch = {**self.data, "stages": stages}
+                patch = {**self.data, "stages": stages, "last_activity_at": time.time()}
                 if key.startswith("summary:") or key.startswith("summary-collapse:"):
                     old_requests = (
                         self.data.get("stages", {}).get(key, {}).get("usage", {}).get("requests", 0)
@@ -431,12 +432,25 @@ def retrieval_tools(
                 if cached:
                     query_vector, fingerprint = cached["vector"], cached["space_fingerprint"]
                 else:
+
+                    async def activity(value: Json) -> None:
+                        await ctx.commit(
+                            {
+                                "embedding_activity": {
+                                    **value,
+                                    "model": embedding.model,
+                                    "revision": embedding.revision,
+                                }
+                            }
+                        )
+
                     vectors, usage = await ctx.ai.embed(
                         embedding,
                         [query],
                         query=True,
                         before_request=ctx.guard,
                         bypass_window=bool(ctx.job.get("bypass_window")),
+                        activity=activity,
                     )
                     query_vector = vectors[0]
                     fingerprint = embedding_fingerprint(embedding.model_dump(), len(query_vector))
@@ -449,7 +463,15 @@ def retrieval_tools(
                                     "space_fingerprint": fingerprint,
                                     "usage": usage,
                                 },
-                            }
+                            },
+                            "query_embedding_usage": {
+                                "requests": ctx.data.get("query_embedding_usage", {}).get("requests", 0) + 1,
+                                "input_tokens": ctx.data.get("query_embedding_usage", {}).get(
+                                    "input_tokens", 0
+                                )
+                                + (usage.get("prompt_tokens", 0) or 0),
+                            },
+                            "embedding_activity": None,
                         }
                     )
             elif mode == "semantic":
@@ -907,6 +929,7 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
     from studyquip.context import ContextBuilder
     from studyquip.textbook import TextbookService
 
+    profile = await ctx.ai.refresh_profile(profile)
     tools = retrieval_tools(ctx, [book["id"]])
     definitions = [
         tool_definition("submit_result", "提交教材修订结果", RevisionDraft.model_json_schema(), profile),
@@ -1046,7 +1069,9 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
 
 async def book_process(ctx: PipelineContext) -> None:
     book = await ctx.bind("book")
+    await ctx.commit({"phase": "准备教材原页"})
     pages = await _prepare_pages(ctx, book)
+    await ctx.commit({"phase": "识别教材草稿"})
     draft_limit = asyncio.Semaphore(ctx.settings.max_active_jobs)
 
     async def recognize(page: Json) -> Json:
@@ -1057,19 +1082,23 @@ async def book_process(ctx: PipelineContext) -> None:
     for output in outputs:
         if isinstance(output, BaseException):
             raise output
-    profile = await ctx.ai.profile_for("chat")
     for page in outputs:
         if page["status"] in {"processed", "skipped"}:
             continue
         if page["status"] == "needs_review":
             raise NeedsReview(f"教材第 {page.get('index', 0) + 1} 个输入页需要重新识别、校对或跳过")
-        await _revise_page(ctx, book, page, profile)
+        await ctx.commit({"phase": "顺序修订教材", "current_page": page.get("index", 0) + 1})
+        await _revise_page(ctx, book, page, await ctx.ai.profile_for("chat"))
 
     def finish(conn: Connection) -> None:
         current = ctx.db.get("book", book["id"], conn=conn) or book
         ctx.db.put("book", {**current, "status": "indexing"}, id=book["id"], conn=conn)
         ctx.jobs.enqueue(
-            "book_index", book["id"], bypass_window=bool(ctx.job.get("bypass_window")), conn=conn
+            "book_index",
+            book["id"],
+            bypass_window=bool(ctx.job.get("bypass_window")),
+            conn=conn,
+            predecessor_id=ctx.job["id"],
         )
 
     await ctx.finish({"book_id": book["id"], "pages": len(pages)}, finish)
@@ -1125,6 +1154,8 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
     from studyquip.context import ContextBuilder, node_source_fingerprint
     from studyquip.retrieval import records
 
+    await ctx.commit({"phase": "生成目录概述"})
+    profile = await ctx.ai.refresh_profile(profile)
     nodes = await asyncio.to_thread(records, ctx.db, "node", {"book_id": book["id"]})
     by_id = {node["id"]: node for node in nodes}
 
@@ -1287,6 +1318,9 @@ async def book_index(ctx: PipelineContext) -> None:
     embedding = next((profile for profile in profiles if profile.role == "embedding"), None)
     if chat:
         await _summarize_nodes(ctx, book, chat)
+    # Summaries can take hours; select the embedding profile again at the embedding boundary.
+    profiles = await ctx.ai.profiles()
+    embedding = next((profile for profile in profiles if profile.role == "embedding"), None)
     if embedding:
         input_budget = embedding.effective_context_tokens(ctx.settings.context_tokens)
         targets = await asyncio.to_thread(retrieval.embedding_targets, book["id"])
@@ -1305,12 +1339,34 @@ async def book_index(ctx: PipelineContext) -> None:
             ):
                 batches.append([])
             batches[-1].append({**target, "marker": marker})
+        total = len(targets)
+        completed = total - sum(len(batch) for batch in batches)
+        await ctx.commit(
+            {"phase": "生成教材向量索引", "embedding_total": total, "embedding_completed": completed}
+        )
+        space = embedding_fingerprint(embedding.model_dump(), embedding.embedding_dimensions or 0)
+
+        async def latest_embedding() -> ModelProfile:
+            from studyquip.scheduling import WindowClosed
+
+            latest = await ctx.ai.profile_for("embedding")
+            if embedding_fingerprint(latest.model_dump(), latest.embedding_dimensions or 0) != space:
+                raise WindowClosed(time.time(), "嵌入空间配置已变化，保留已有结果并按新空间恢复索引")
+            return latest
+
+        async def activity(value: Json) -> None:
+            await ctx.commit(
+                {"embedding_activity": {**value, "model": embedding.model, "revision": embedding.revision}}
+            )
+
         for batch in batches:
+            embedding = await latest_embedding()
             vectors, usage = await ctx.ai.embed(
                 embedding,
                 [item["text"] for item in batch],
                 before_request=ctx.guard,
                 bypass_window=bool(ctx.job.get("bypass_window")),
+                activity=activity,
             )
             fingerprint = embedding_fingerprint(embedding.model_dump(), len(vectors[0]))
 
@@ -1326,14 +1382,23 @@ async def book_index(ctx: PipelineContext) -> None:
                         conn=conn,
                     )
 
+            completed += len(batch)
+            previous_usage = ctx.data.get("embedding_usage", {})
             await ctx.commit(
                 {
                     "embedded": [*ctx.data.get("embedded", []), *(item["marker"] for item in batch)],
-                    "embedding_usage": usage,
+                    "embedding_usage": {
+                        "requests": previous_usage.get("requests", 0) + 1,
+                        "input_tokens": previous_usage.get("input_tokens", 0)
+                        + (usage.get("prompt_tokens", 0) or 0),
+                    },
+                    "embedding_completed": completed,
+                    "embedding_activity": None,
                     "phase": "生成教材向量索引",
                 },
                 write,
             )
+        await latest_embedding()
 
     def ready(conn: Connection) -> None:
         current = ctx.db.get("book", book["id"], conn=conn) or book

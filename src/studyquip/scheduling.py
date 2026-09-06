@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -113,10 +113,17 @@ class CapacityLimiter:
         )
 
     @asynccontextmanager
-    async def slot(self, profile: Any, eligible: Callable[[], None] | None = None) -> AsyncIterator[None]:
+    async def slot(
+        self,
+        profile: Any,
+        eligible: Callable[[], None] | None = None,
+        refresh: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[None]:
         bucket, identity = model_bucket(self.secret, profile)
-        async with self._condition:
-            while True:
+        while True:
+            if refresh:
+                await refresh()
+            async with self._condition:
                 if eligible:
                     eligible()
                 model_cap, credential_cap = self.effective(profile)

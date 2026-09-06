@@ -1,5 +1,11 @@
 import { useState } from "react";
 import { post, put, remove } from "./api";
+import {
+  ResourceProgress,
+  useJobs,
+  matchingJobs,
+  isActiveJob,
+} from "./JobProgress";
 import { roleLabels, type Model, type Subject } from "./types";
 import {
   Button,
@@ -19,6 +25,7 @@ export default function Models({
   onSubjectsChanged: () => void;
 }) {
   const remote = useRemote<Model[]>("/models", []);
+  const tasks = useJobs();
   const [editing, setEditing] = useState<Model | null>(null),
     [testing, setTesting] = useState<Model | null>(null),
     [subject, setSubject] = useState("");
@@ -99,11 +106,31 @@ export default function Models({
               </p>
             </button>
             <div className="inline-actions">
-              <Button onClick={() => setTesting(model)}>测试连接</Button>
+              <Button
+                disabled={
+                  !tasks.ready ||
+                  !!tasks.error ||
+                  matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+                    isActiveJob,
+                  )
+                }
+                onClick={() => setTesting(model)}
+              >
+                {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+                  isActiveJob,
+                )
+                  ? "测试已安排"
+                  : "测试连接"}
+              </Button>
               <Button onClick={() => setEditing({ ...model, api_key: "" })}>
                 编辑
               </Button>
             </div>
+            {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+              isActiveJob,
+            ) && (
+              <ResourceProgress resourceId={model.id} kinds={["model_test"]} />
+            )}
           </div>
         ))}
       </div>
@@ -244,6 +271,9 @@ function ModelEditor({
           }
         }}
       >
+        <p className="hint">
+          保存后，后续处理单元使用最新模型和生成参数；并发、可用时段、超时与重试设置在后续请求生效。已发出的请求继续完成，无需重启服务。
+        </p>
         <div className="form-grid">
           <Field label="配置名称">
             <input

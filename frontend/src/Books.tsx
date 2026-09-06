@@ -15,6 +15,14 @@ import {
 } from "./ui";
 import { MathText } from "./Content";
 import Uploads from "./Uploads";
+import {
+  ResourceProgress,
+  useResourceJobs,
+  useJobs,
+  matchingJobs,
+  isActiveJob,
+  useJobCompletion,
+} from "./JobProgress";
 type Node = Entity & {
   parent_id: string | null;
   title: string;
@@ -81,6 +89,8 @@ export default function Books({
   initialBookId?: string | null;
 }) {
   const remote = useRemote<Book[]>("/books", []);
+  const tasks = useJobs();
+  useJobCompletion(tasks.jobs, remote.reload);
   const newBook = (): Book => ({
     id: "",
     revision: 0,
@@ -186,8 +196,27 @@ export default function Books({
                 <span>
                   {subjects.find((s) => s.id === book.subject_id)?.name}
                 </span>
-                <Badge status={book.status || "draft"} />
+                <Badge
+                  status={
+                    matchingJobs(tasks.jobs, book.id, undefined, true).find(
+                      isActiveJob,
+                    )?.status ||
+                    book.status ||
+                    "draft"
+                  }
+                />
               </div>
+              {matchingJobs(tasks.jobs, book.id, undefined, true)
+                .filter(isActiveJob)
+                .slice(0, 1)
+                .map((job) => (
+                  <p className="hint" key={job.id}>
+                    {job.progress?.phase || "等待处理"}
+                    {job.progress?.total_pages
+                      ? ` · 已识别 ${job.progress.recognized_pages}/${job.progress.total_pages} 页 · 已整理 ${job.progress.processed_pages}/${job.progress.total_pages} 页`
+                      : ""}
+                  </p>
+                ))}
             </div>
             <ArrowUpRight
               className="row-arrow"
@@ -338,6 +367,8 @@ function BookDetail({
   const pendingOperation = useRef<{ signature: string; id: string } | null>(
     null,
   );
+  const tasks = useResourceJobs(book.id, undefined, true);
+  useJobCompletion(tasks.jobs, refresh);
   function refresh() {
     nodes.reload();
     blocks.reload();
@@ -379,7 +410,7 @@ function BookDetail({
           <h1>{book.title}</h1>
           <div className="record-meta">
             <span>{subjects.find((s) => s.id === book.subject_id)?.name}</span>
-            <Badge status={book.status} />
+            <Badge status={tasks.active[0]?.status || book.status} />
           </div>
         </div>
         <div className="inline-actions">
@@ -387,12 +418,18 @@ function BookDetail({
           <Button onClick={() => setEditing(true)}>教材设置</Button>
           <Button
             kind="primary"
+            disabled={tasks.blocked}
             onClick={() => setSchedule(`/books/${book.id}/process`)}
           >
-            识别与整理
+            {tasks.active.length
+              ? "已有处理任务"
+              : !tasks.ready
+                ? "读取任务状态…"
+                : "识别与整理"}
           </Button>
         </div>
       </div>
+      <ResourceProgress resourceId={book.id} includeChildren />
       <div className="tabs">
         <Button
           kind={tab === "article" ? "active" : ""}
@@ -488,7 +525,9 @@ function BookDetail({
               error={blocks.error}
               empty={!visible.length}
             >
-              尚无整理后的正文。先运行“识别与整理”，或手动添加内容。
+              {tasks.active.length
+                ? "处理任务已安排，具体进度见上方。正式整理完成后，正文会在这里显示。"
+                : "尚无整理后的正文。先运行“识别与整理”，或手动添加内容。"}
             </State>
             {visible.map((b) => (
               <section key={b.id} className={`textbook-block ${b.type}`}>
@@ -523,7 +562,7 @@ function BookDetail({
           </State>
           {pages.data.map((page, i) => (
             <PageEditor
-              key={`${page.id}-${page.revision}`}
+              key={page.id}
               page={page}
               index={i}
               bookId={book.id}
@@ -577,6 +616,16 @@ function BookDetail({
               </div>
               <div className="actions">
                 <Button
+                  disabled={
+                    !tasks.ready ||
+                    !!tasks.error ||
+                    tasks.active.some(
+                      (job) =>
+                        job.resource_id === s.id ||
+                        (job.resource_id === book.id &&
+                          job.status !== "waiting_review"),
+                    )
+                  }
                   onClick={() =>
                     setSchedule(
                       `/books/${book.id}/suggestions/${s.id}/regenerate`,
@@ -988,17 +1037,31 @@ function PageEditor({
   onChanged: () => void;
   onSchedule: (path: string) => void;
 }) {
-  const [text, setText] = useState(page.text || ""),
+  const [draft, setDraft] = useState({
+      text: page.text || "",
+      revision: page.revision,
+      dirty: false,
+    }),
     [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!draft.dirty && page.revision >= draft.revision)
+      setDraft({
+        text: page.text || "",
+        revision: page.revision,
+        dirty: false,
+      });
+  }, [page.text, page.revision, draft.dirty, draft.revision]);
   const notice = useNotice();
   const imageId =
     page.image_asset?.id || page.image_asset_id || page.source_asset_id;
+  const tasks = useResourceJobs(page.id, ["page_recognize"]);
+  const parentTasks = useResourceJobs(bookId, ["book_process", "book_index"]);
   async function action(name: string) {
     setBusy(true);
     try {
       await post(`/books/${bookId}/pages/${page.id}/${name}`, {
-        text,
-        revision: page.revision,
+        text: draft.text,
+        revision: draft.revision,
       });
       onChanged();
       notice("页面处理方式已更新。");
@@ -1029,19 +1092,34 @@ function PageEditor({
           <Field label="本页提取内容">
             <textarea
               rows={12}
-              value={text}
-              onChange={(e) => setText(e.target.value)}
+              value={draft.text}
+              onChange={(e) =>
+                setDraft({ ...draft, text: e.target.value, dirty: true })
+              }
             />
           </Field>
+          {draft.dirty && page.revision !== draft.revision && (
+            <p className="hint">
+              后台已更新此页，已保留你的未保存内容。保存前请与最新草稿核对。
+            </p>
+          )}
           <div className="inline-actions wrap">
             <Button
               busy={busy}
               onClick={async () => {
                 setBusy(true);
                 try {
-                  await put(`/books/${bookId}/pages/${page.id}`, {
-                    text,
-                    revision: page.revision,
+                  const saved = await put<Page>(
+                    `/books/${bookId}/pages/${page.id}`,
+                    {
+                      text: draft.text,
+                      revision: draft.revision,
+                    },
+                  );
+                  setDraft({
+                    text: saved.text || "",
+                    revision: saved.revision,
+                    dirty: false,
                   });
                   onChanged();
                   notice("本页草稿已保存。");
@@ -1055,11 +1133,17 @@ function PageEditor({
               保存草稿
             </Button>
             <Button
+              disabled={
+                tasks.blocked ||
+                parentTasks.active.some(
+                  (job) => job.status !== "waiting_review",
+                )
+              }
               onClick={() =>
                 onSchedule(`/books/${bookId}/pages/${page.id}/recognize`)
               }
             >
-              重新识别
+              {tasks.active.length ? "已安排重新识别" : "重新识别"}
             </Button>
             <Button onClick={() => void action("text-only")}>仅使用文本</Button>
             <Button onClick={() => void action("skip")}>跳过此页</Button>

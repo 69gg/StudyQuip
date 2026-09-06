@@ -25,6 +25,13 @@ import {
 } from "./ui";
 import { MathText, QuestionContent } from "./Content";
 import Uploads from "./Uploads";
+import {
+  ResourceProgress,
+  useResourceJobs,
+  useJobs,
+  isActiveJob,
+  useJobCompletion,
+} from "./JobProgress";
 export function emptyQuestion(subjectId: string): Question {
   return {
     id: "",
@@ -61,6 +68,8 @@ export default function Questions({
   initialQuestionId?: string | null;
 }) {
   const remote = useRemote<Question[]>("/questions", []);
+  const tasks = useJobs();
+  useJobCompletion(tasks.jobs, remote.reload);
   const [search, setSearch] = useState(""),
     [subject, setSubject] = useState(""),
     [type, setType] = useState(""),
@@ -117,6 +126,11 @@ export default function Questions({
           </Button>
         </div>
       </div>
+      {tasks.jobs
+        .filter((job) => job.kind === "export_pdf" && isActiveJob(job))
+        .map((job) => (
+          <ResourceProgress key={job.id} resourceId={job.resource_id} />
+        ))}
       {books.length === 0 && (
         <div className="gentle-notice library-notice">
           <BookOpen size={18} strokeWidth={1.7} aria-hidden="true" />
@@ -343,6 +357,14 @@ function QuestionEditor({
     [schedule, setSchedule] = useState<"extract" | "explain" | null>(null),
     [preview, setPreview] = useState(false);
   const notice = useNotice();
+  const tasks = useResourceJobs(q.id, ["question_extract", "question_explain"]);
+  useJobCompletion(tasks.jobs, () => {
+    if (!dirty && q.id)
+      void api<Question>(`/questions/${q.id}`)
+        .then(setQ)
+        .catch((e) => notice(e.message, true));
+    onSaved();
+  });
   function update<K extends keyof Question>(key: K, value: Question[K]) {
     setDirty(true);
     setQ((old) => ({
@@ -424,11 +446,20 @@ function QuestionEditor({
               载入最新结果
             </Button>
           )}
-          <Button disabled={busy} onClick={() => setSchedule("extract")}>
-            AI 整理题目
+          <Button
+            disabled={busy || tasks.blocked}
+            onClick={() => setSchedule("extract")}
+          >
+            {tasks.active.length ? "题目处理中" : "AI 整理题目"}
           </Button>
         </div>
       </div>
+      {q.id && (
+        <ResourceProgress
+          resourceId={q.id}
+          kinds={["question_extract", "question_explain"]}
+        />
+      )}
       {preview ? (
         <QuestionContent question={q} answer explanation knowledge />
       ) : (
@@ -674,10 +705,10 @@ function QuestionEditor({
           </Button>
           <Button
             kind="primary"
-            disabled={!q.answer_confirmed || dirty}
+            disabled={!q.answer_confirmed || dirty || tasks.blocked}
             onClick={() => setSchedule("explain")}
           >
-            生成讲解
+            {tasks.active.length ? "已有处理任务" : "生成讲解"}
           </Button>
         </div>
       </div>
@@ -709,6 +740,13 @@ function ExportDialog({
     [blank, setBlank] = useState(5),
     [busy, setBusy] = useState(false);
   const notice = useNotice();
+  const tasks = useJobs();
+  const pending = tasks.jobs.find(
+    (job) =>
+      job.kind === "export_pdf" &&
+      isActiveJob(job) &&
+      job.question_ids?.some((id) => questions.some((q) => q.id === id)),
+  );
   return (
     <Modal title="导出 PDF" onClose={onClose} wide>
       <div className="export-grid">
@@ -773,6 +811,7 @@ function ExportDialog({
           <Button
             kind="primary"
             busy={busy}
+            disabled={!tasks.ready || !!tasks.error || !!pending}
             onClick={async () => {
               setBusy(true);
               try {

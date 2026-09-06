@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -9,9 +11,14 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.engine import Connection
 
-from .db import Database, jobs_table
+from .db import ConflictError, Database, jobs_table
 
 Mutation = Callable[[Connection], Any]
+ACTIVE_STATUSES = ("queued", "running", "waiting_window", "waiting_review")
+JOB_FAMILIES = (
+    ("book_process", "book_index"),
+    ("question_extract", "question_explain"),
+)
 
 
 class LeaseLost(RuntimeError):
@@ -26,6 +33,59 @@ class JobStore:
     def now(conn: Connection) -> float:
         return float(conn.scalar(select(func.unixepoch("subsec"))))
 
+    def active_for(
+        self, kind: str, resource_id: str, conn: Connection, exclude_id: str | None = None
+    ) -> dict[str, Any] | None:
+        family = next((group for group in JOB_FAMILIES if kind in group), (kind,))
+        query = select(jobs_table).where(
+            jobs_table.c.kind.in_(family),
+            jobs_table.c.resource_id == resource_id,
+            jobs_table.c.status.in_(ACTIVE_STATUSES),
+        )
+        if exclude_id:
+            query = query.where(jobs_table.c.id != exclude_id)
+        row = conn.execute(query.order_by(jobs_table.c.created_at)).mappings().first()
+        return dict(row) if row else None
+
+    def request(
+        self, kind: str, specification: dict[str, Any], create: Mutation, *, conn: Connection | None = None
+    ) -> dict[str, Any]:
+        """同一导出或检索请求的资源创建和认领键在同一写事务中提交。"""
+        if conn is None:
+            with self.db.write() as active:
+                return self.request(kind, specification, create, conn=active)
+        key = hashlib.sha256(
+            json.dumps(specification, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        row = (
+            conn.execute(
+                select(jobs_table).where(
+                    jobs_table.c.kind == kind,
+                    jobs_table.c.status.in_(ACTIVE_STATUSES),
+                    jobs_table.c.payload["request_key"].as_string() == key,
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row:
+            return {**dict(row), "reused": True}
+        resource = create(conn)
+        return self.enqueue(kind, resource["id"], {"request_key": key}, conn=conn)
+
+    def configuration_changed(self, conn: Connection) -> None:
+        """窗口等待来自一次已到期执行；重新评估窗口，不提前用户预约的 queued 任务。"""
+        now = self.now(conn)
+        conn.execute(
+            jobs_table.update()
+            .where(jobs_table.c.status == "waiting_window")
+            .values(
+                not_before=now,
+                error="模型配置已更新，等待重新检查可用时段",
+                updated_at=now,
+            )
+        )
+
     def enqueue(
         self,
         kind: str,
@@ -35,10 +95,34 @@ class JobStore:
         bypass_window: bool = False,
         *,
         conn: Connection | None = None,
+        predecessor_id: str | None = None,
     ) -> dict[str, Any]:
         if conn is None:
             with self.db.write() as active:
-                return self.enqueue(kind, resource_id, payload, not_before, bypass_window, conn=active)
+                return self.enqueue(
+                    kind,
+                    resource_id,
+                    payload,
+                    not_before,
+                    bypass_window,
+                    conn=active,
+                    predecessor_id=predecessor_id,
+                )
+        if predecessor_id:
+            predecessor = self.get(predecessor_id, conn)
+            if not (
+                kind == "book_index"
+                and predecessor
+                and predecessor["kind"] == "book_process"
+                and predecessor["resource_id"] == resource_id
+                and predecessor["status"] == "running"
+            ):
+                raise ValueError("无效的教材后续任务")
+        existing = self.active_for(kind, resource_id, conn, predecessor_id)
+        if existing:
+            if existing["kind"] == kind:
+                return {**existing, "reused": True}
+            raise ConflictError("该内容已有未结束的处理任务，请在任务页查看、继续或取消")
         now = self.now(conn)
         job = {
             "id": str(uuid.uuid4()),
@@ -68,16 +152,19 @@ class JobStore:
         row = conn.execute(select(jobs_table).where(jobs_table.c.id == id)).mappings().first()
         return dict(row) if row else None
 
-    def list(self, limit: int = 100, *, conn: Connection | None = None) -> list[dict[str, Any]]:
+    def list(
+        self, limit: int = 100, *, conn: Connection | None = None, include_active: bool = False
+    ) -> list[dict[str, Any]]:
         if conn is None:
             with self.db.read() as active:
-                return self.list(limit, conn=active)
-        return [
-            dict(row)
-            for row in conn.execute(
-                select(jobs_table).order_by(jobs_table.c.created_at.desc()).limit(limit)
-            ).mappings()
-        ]
+                return self.list(limit, conn=active, include_active=include_active)
+        query = select(jobs_table).order_by(jobs_table.c.created_at.desc())
+        if include_active:
+            recent = select(jobs_table.c.id).order_by(jobs_table.c.created_at.desc()).limit(limit)
+            query = query.where(or_(jobs_table.c.status.in_(ACTIVE_STATUSES), jobs_table.c.id.in_(recent)))
+        else:
+            query = query.limit(limit)
+        return [dict(row) for row in conn.execute(query).mappings()]
 
     def claim(self, owner: str) -> dict[str, Any] | None:
         with self.db.write() as conn:
@@ -325,6 +412,8 @@ class JobStore:
                 raise ValueError("任务不存在")
             if row["status"] in {"running", "completed"}:
                 raise ValueError("运行中或已完成的任务不能改期；请先取消或创建新任务")
+            if self.active_for(row["kind"], row["resource_id"], conn, id):
+                raise ConflictError("已有同一内容的处理任务，不能重复恢复旧任务")
             conn.execute(
                 jobs_table.update()
                 .where(jobs_table.c.id == id)

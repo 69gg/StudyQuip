@@ -48,6 +48,19 @@ export async function api<T>(
       response.status,
     );
   }
+  if (method !== "GET" && method !== "HEAD") {
+    const result = data as {
+      job?: unknown;
+      kind?: string;
+      status?: string;
+    } | null;
+    window.dispatchEvent(
+      new CustomEvent("studyquip:jobs-changed", {
+        detail:
+          result?.job || (result?.kind && result.status ? result : undefined),
+      }),
+    );
+  }
   return data as T;
 }
 export const post = <T>(path: string, body: unknown = {}) =>

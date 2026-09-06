@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright
+from sqlalchemy.engine import Connection
 
 from .config import Settings
 from .db import Database
@@ -36,7 +37,7 @@ def explanation_stale(db: Database, question: dict[str, Any]) -> bool:
     return False
 
 
-def create_snapshot(db: Database, spec: ExportInput) -> dict[str, Any]:
+def create_snapshot(db: Database, spec: ExportInput, conn: Connection | None = None) -> dict[str, Any]:
     if spec.mode == "practice":
         spec = spec.model_copy(
             update={"include_answer": False, "include_explanation": False, "include_knowledge": False}
@@ -45,7 +46,7 @@ def create_snapshot(db: Database, spec: ExportInput) -> dict[str, Any]:
         raise ValueError("导出题目不能重复")
     questions: list[dict[str, Any]] = []
     for id in spec.question_ids:
-        question = db.get("question", id)
+        question = db.get("question", id, conn=conn)
         if not question or question.get("deleted"):
             raise ValueError("所选题目不存在")
         validate_question(question)
@@ -64,6 +65,7 @@ def create_snapshot(db: Database, spec: ExportInput) -> dict[str, Any]:
             "token": secrets.token_urlsafe(32),
             "token_expires_at": None,
         },
+        conn=conn,
     )
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import hmac
 import json
 import math
 import time
@@ -35,6 +37,7 @@ ResultModel = TypeVar("ResultModel", bound=BaseModel)
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = ""
+    revision: int = 0
     name: str = ""
     role: Literal["vision", "chat", "embedding"] = "chat"
     protocol: Literal["chat", "responses"] = "chat"
@@ -250,6 +253,41 @@ class AIService:
             raise AIProtocolError(f"请先在设置中配置 {role} 模型")
         return matches[0]
 
+    async def refresh_profile(self, profile: ModelProfile) -> ModelProfile:
+        if not profile.id:
+            return profile
+        latest = await self.profile_for(profile.role, profile.id)
+        if latest.role != profile.role:
+            raise AIProtocolError("模型用途已改变，请为原用途配置模型后重试")
+        return latest
+
+    def binding(self, profile: ModelProfile) -> Json:
+        # Only an HMAC is persisted for credentials and wire settings, never the values themselves.
+        fields = profile.model_dump(
+            mode="json",
+            exclude={
+                "id",
+                "revision",
+                "name",
+                "timeout_seconds",
+                "retries",
+                "max_concurrency",
+                "credential_max_concurrency",
+                "windows",
+                "timezone",
+            },
+        )
+        fingerprint = hmac.new(
+            self.db.secret(), json.dumps(fields, sort_keys=True).encode(), hashlib.sha256
+        ).hexdigest()
+        return {
+            "fingerprint": fingerprint,
+            "model": profile.model,
+            "profile_id": profile.id,
+            "revision": profile.revision,
+            "protocol": profile.protocol,
+        }
+
     async def _request(
         self,
         profile: ModelProfile,
@@ -258,68 +296,105 @@ class AIService:
         *,
         before_request: BeforeRequest | None,
         bypass_window: bool,
+        activity: SaveState | None = None,
     ) -> Json:
-        self.limiter.configure(await self.profiles())
+        runtime = profile
+
+        async def refresh() -> None:
+            nonlocal runtime
+            profiles = await self.profiles()
+            self.limiter.configure(profiles)
+            latest = (
+                next((item for item in profiles if item.id == profile.id), None) if profile.id else profile
+            )
+            if latest is None or latest.role != profile.role:
+                raise AIProtocolError("模型配置已删除或用途已改变，请重新配置后重试")
+            runtime = profile.model_copy(
+                update={
+                    field: getattr(latest, field)
+                    for field in (
+                        "timeout_seconds",
+                        "retries",
+                        "max_concurrency",
+                        "credential_max_concurrency",
+                        "windows",
+                        "timezone",
+                    )
+                }
+            )
 
         def eligible() -> None:
             if not bypass_window:
                 now = time.time()
-                until = next_allowed(now, profile.windows, profile.timezone)
+                until = next_allowed(now, runtime.windows, runtime.timezone)
                 if until > now:
                     raise WindowClosed(until)
 
-        client_args: Json = {
-            "api_key": profile.api_key,
-            "base_url": profile.base_url,
-            "organization": profile.organization,
-            "project": profile.project,
-            "max_retries": 0,
-            "timeout": profile.timeout_seconds,
-        }
-        if self.transport is not None:
-            client_args["http_client"] = httpx.AsyncClient(transport=self.transport)
-        async with AsyncOpenAI(**client_args) as client:
-            for attempt in range(profile.retries + 1):
-                eligible()
-                if before_request:
-                    await before_request()
-                try:
-                    async with self.limiter.slot(profile, eligible):
-                        if before_request:
-                            await before_request()
+        attempt = 0
+        while True:
+            await refresh()
+            eligible()
+            if before_request:
+                await before_request()
+            if activity:
+                await activity({"state": "waiting_capacity", "at": time.time(), "attempt": attempt + 1})
+            try:
+                async with self.limiter.slot(profile, eligible, refresh):
+                    if before_request:
+                        await before_request()
+                    if activity:
+                        await activity({"state": "requesting", "at": time.time(), "attempt": attempt + 1})
+                    client_args: Json = {
+                        "api_key": profile.api_key,
+                        "base_url": profile.base_url,
+                        "organization": profile.organization,
+                        "project": profile.project,
+                        "max_retries": 0,
+                        "timeout": runtime.timeout_seconds,
+                    }
+                    if self.transport is not None:
+                        client_args["http_client"] = httpx.AsyncClient(transport=self.transport)
+                    async with AsyncOpenAI(**client_args) as client:
                         if operation == "embedding":
                             response = await client.embeddings.create(**params)
                         elif profile.protocol == "chat":
                             response = await client.chat.completions.create(**params)
                         else:
                             response = await client.responses.create(**params)
-                        return response.model_dump(mode="json", exclude_none=True)
-                except (APIConnectionError, APITimeoutError, APIStatusError) as error:
-                    transient = (
-                        not isinstance(error, APIStatusError)
-                        or error.status_code in {408, 409, 429}
-                        or error.status_code >= 500
+                    return response.model_dump(mode="json", exclude_none=True)
+            except (APIConnectionError, APITimeoutError, APIStatusError) as error:
+                transient = (
+                    not isinstance(error, APIStatusError)
+                    or error.status_code in {408, 409, 429}
+                    or error.status_code >= 500
+                )
+                if not transient or attempt >= runtime.retries:
+                    # Never retain headers or the full provider request in task errors.
+                    status = getattr(error, "status_code", "network")
+                    body = getattr(error, "body", None)
+                    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                        body = body["error"]
+                    detail = str(body.get("message", "")) if isinstance(body, dict) else ""
+                    if profile.api_key:
+                        detail = detail.replace(profile.api_key, "[已隐藏凭据]")
+                    raise AIProtocolError(
+                        f"模型请求失败（{status}）：{detail or '请检查模型配置或稍后重试'}"
+                    ) from error
+                retry_after = (
+                    error.response.headers.get("retry-after") if isinstance(error, APIStatusError) else None
+                )
+                delay = parse_retry_after(retry_after, time.time(), min(2**attempt, 30))
+                if activity:
+                    await activity(
+                        {
+                            "state": "retrying",
+                            "at": time.time(),
+                            "next_at": time.time() + delay,
+                            "attempt": attempt + 1,
+                        }
                     )
-                    if not transient or attempt >= profile.retries:
-                        # Never retain headers or the full provider request in task errors.
-                        status = getattr(error, "status_code", "network")
-                        body = getattr(error, "body", None)
-                        if isinstance(body, dict) and isinstance(body.get("error"), dict):
-                            body = body["error"]
-                        detail = str(body.get("message", "")) if isinstance(body, dict) else ""
-                        if profile.api_key:
-                            detail = detail.replace(profile.api_key, "[已隐藏凭据]")
-                        raise AIProtocolError(
-                            f"模型请求失败（{status}）：{detail or '请检查模型配置或稍后重试'}"
-                        ) from error
-                    retry_after = (
-                        error.response.headers.get("retry-after")
-                        if isinstance(error, APIStatusError)
-                        else None
-                    )
-                    delay = parse_retry_after(retry_after, time.time(), min(2**attempt, 30))
-                    await asyncio.sleep(delay)
-        raise AIProtocolError("模型请求没有返回结果")
+                await asyncio.sleep(delay)
+                attempt += 1
 
     async def structured(
         self,
@@ -337,6 +412,14 @@ class AIService:
         state = state if state is not None else {}
         if "result" in state:
             return schema.model_validate(state["result"])
+        profile = await self.refresh_profile(profile)
+        binding = self.binding(profile)
+        if state.get("transcript") and state.get("binding", {}).get("fingerprint") != binding["fingerprint"]:
+            # A resumed incomplete unit can be rebuilt; completed business units remain untouched.
+            for key in ("transcript", "pending", "rounds", "repairs"):
+                state.pop(key, None)
+            state["configuration_restarts"] = state.get("configuration_restarts", 0) + 1
+        state["binding"] = binding
         handlers = tools or {}
         definitions = [
             tool_definition(
@@ -366,6 +449,16 @@ class AIService:
             if save:
                 await save(state)
 
+        async def activity(value: Json) -> None:
+            state["activity"] = {
+                **value,
+                "model": profile.model,
+                "profile_id": profile.id,
+                "revision": profile.revision,
+                "role": profile.role,
+            }
+            await persist()
+
         while True:
             pending: list[Json] = state.get("pending", [])
             if pending:
@@ -381,6 +474,7 @@ class AIService:
                             result = schema.model_validate(arguments)
                             state["result"] = result.model_dump(mode="json")
                             state["pending"] = []
+                            state.pop("activity", None)
                             await persist()
                             return result
                         if name not in handlers:
@@ -432,8 +526,14 @@ class AIService:
                     "完整工具上下文超过输入预算；请缩小页面处理单元，不能裁剪未完成的协议项"
                 )
             response = await self._request(
-                profile, "structured", params, before_request=before_request, bypass_window=bypass_window
+                profile,
+                "structured",
+                params,
+                before_request=before_request,
+                bypass_window=bypass_window,
+                activity=activity,
             )
+            state["activity"] = {**state.get("activity", {}), "state": "tools", "at": time.time()}
             state["rounds"] = state.get("rounds", 0) + 1
             usage = response.get("usage", {})
             totals = state.setdefault("usage", {"requests": 0, "input_tokens": 0, "output_tokens": 0})
@@ -481,6 +581,7 @@ class AIService:
         query: bool = False,
         before_request: BeforeRequest | None = None,
         bypass_window: bool = False,
+        activity: SaveState | None = None,
     ) -> tuple[list[list[float]], Json]:
         if not texts:
             return [], {}
@@ -495,7 +596,12 @@ class AIService:
         if profile.extra_body:
             params["extra_body"] = profile.extra_body
         response = await self._request(
-            profile, "embedding", params, before_request=before_request, bypass_window=bypass_window
+            profile,
+            "embedding",
+            params,
+            before_request=before_request,
+            bypass_window=bypass_window,
+            activity=activity,
         )
         data = sorted(response.get("data", []), key=lambda item: item["index"])
         if len(data) != len(texts) or [row["index"] for row in data] != list(range(len(texts))):

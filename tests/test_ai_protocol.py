@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 from typing import Any
 
@@ -285,3 +287,128 @@ async def test_invalid_result_repairs_once_and_does_not_accept_free_text() -> No
     with pytest.raises(AIProtocolError, match="修复后仍"):
         await ai.structured(configured, "test", Result)
     assert count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+async def test_hot_reload_pins_tool_loop_and_rebuilds_only_unfinished_unit(protocol: str) -> None:
+    configured = profile(id="editable", revision=1, protocol=protocol)
+    profiles = FakeProfiles([configured])
+    requests: list[dict[str, Any]] = []
+    state: dict[str, Any] = {}
+    interrupted: dict[str, Any] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        requests.append(wire)
+        name = "read" if len(requests) == 1 else "submit_result"
+        arguments = "{}" if name == "read" else '{"answer":"完成"}'
+        if "messages" in wire:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chat",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": wire["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": str(len(requests)),
+                                        "type": "function",
+                                        "function": {"name": name, "arguments": arguments},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "response",
+                "object": "response",
+                "created_at": 1,
+                "model": wire["model"],
+                "status": "completed",
+                "output": [
+                    {"id": "rs", "type": "reasoning", "summary": [], "encrypted_content": "old-envelope"},
+                    {
+                        "id": "fc",
+                        "type": "function_call",
+                        "call_id": str(len(requests)),
+                        "name": name,
+                        "arguments": arguments,
+                        "status": "completed",
+                    },
+                ],
+            },
+        )
+
+    async def read(arguments: dict[str, Any]) -> dict[str, str]:
+        interrupted.update(copy.deepcopy(state))
+        profiles.profiles = [
+            configured.model_copy(
+                update={
+                    "revision": 2,
+                    "model": "new-model",
+                    "protocol": "responses" if protocol == "chat" else "chat",
+                    "api_key": "replacement-key",
+                }
+            )
+        ]
+        return {"text": "当前原文"}
+
+    ai = AIService(profiles, Settings(), transport=httpx.MockTransport(respond))
+    tools = {"read": ("read", {"type": "object", "properties": {}}, read)}
+    assert (await ai.structured(configured, "初始单元", Result, tools=tools, state=state)).answer == "完成"
+    assert [wire["model"] for wire in requests] == [configured.model, configured.model]
+    assert "replacement-key" not in str(state) and configured.api_key not in str(state)
+    # Resuming a partially persisted unit rebuilds it instead of sending old reasoning/tool items to another API.
+    assert (
+        await ai.structured(configured, "初始单元", Result, tools=tools, state=interrupted)
+    ).answer == "完成"
+    assert requests[-1]["model"] == "new-model"
+    assert ("input" in requests[-1]) is (protocol == "chat")
+    assert "old-envelope" not in json.dumps(requests[-1])
+    assert interrupted["configuration_restarts"] == 1
+    assert interrupted["binding"]["revision"] == 2
+    call_count = len(requests)
+    await ai.structured(configured, "已完成单元", Result, state=state)
+    assert len(requests) == call_count  # Completed business units stay cached.
+
+
+@pytest.mark.asyncio
+async def test_waiting_request_reloads_capacity_without_releasing_existing_slot() -> None:
+    configured = profile(id="capacity", max_concurrency=1)
+    profiles = FakeProfiles([configured])
+    waiting = asyncio.Event()
+    ai = AIService(
+        profiles,
+        Settings(),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 0.5]}]})
+        ),
+    )
+
+    async def activity(value: dict[str, Any]) -> None:
+        if value["state"] == "waiting_capacity":
+            waiting.set()
+
+    async with ai.limiter.slot(configured):
+        request = asyncio.create_task(ai.embed(configured, ["测试"], activity=activity))
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            assert not request.done()
+            profiles.profiles = [configured.model_copy(update={"max_concurrency": 2, "revision": 2})]
+            vectors, _ = await asyncio.wait_for(request, 3)
+            assert vectors == [[1.0, 0.5]]
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)

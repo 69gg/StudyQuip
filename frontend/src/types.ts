@@ -55,6 +55,49 @@ export type Job = Entity & {
   defer_reason?: string;
   waiting_reason?: string;
   payload?: Record<string, unknown>;
+  blocking?: boolean;
+  recovering?: boolean;
+  reused?: boolean;
+  resource_title?: string;
+  book_id?: string;
+  question_ids?: string[];
+  attempts?: number;
+  input?: Record<string, unknown>;
+  progress?: {
+    phase?: string;
+    total_pages?: number;
+    recognized_pages?: number;
+    processed_pages?: number;
+    pending_pages?: number;
+    review_pages?: number;
+    skipped_pages?: number;
+    blocks?: number;
+    nodes?: number;
+    summarized_nodes?: number;
+    current_page?: number;
+    embedding_total?: number;
+    embedding_completed?: number;
+    completed_units?: number;
+    completed_stages?: number;
+    last_activity_at?: number;
+    usage?: {
+      requests?: number;
+      input_tokens?: number;
+      output_tokens?: number;
+    };
+    active_requests?: RequestActivity[];
+    embedding_activity?: RequestActivity;
+  };
+};
+export type RequestActivity = {
+  state: string;
+  at?: number;
+  next_at?: number;
+  model?: string;
+  revision?: number;
+  page?: number;
+  rounds?: number;
+  attempt?: number;
 };
 export type Model = Entity & {
   name: string;

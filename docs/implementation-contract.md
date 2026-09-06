@@ -12,15 +12,18 @@
 
 数据库初始化集中在 `db.initialize(settings)`，先 doctor 再独占迁移锁，Alembic 创建公共 records/history/jobs 表，并调用 `retrieval.initialize_indexes(conn)` 创建检索专用表。模块不得在 import 时创建库。
 
-`jobs.JobStore(db)`：`enqueue(kind, resource_id, payload=None, not_before=None, bypass_window=False)`；`claim(owner)`；`renew(id,owner,token)`；`assert_lease(conn,id,owner,token)`；`finish(id,owner,token,result=None, mutate=None)`（mutate(conn) 与结果提交同事务）；`fail(...)`；`defer(...,until,reason)`；`cancel(id)`；`reschedule(id,not_before,bypass_window=False)`；`get(id)`；`list(limit=100)`。时间为 Unix UTC 秒；claim 结果含 id,kind,resource_id,payload,checkpoint,lease_token,owner,status。checkpoint 通过 `checkpoint(id,owner,token,data,mutate=None)` 原子更新。
+`jobs.JobStore(db)`：`enqueue(kind, resource_id, payload=None, not_before=None, bypass_window=False, *, conn=None, predecessor_id=None)`；`claim(owner)`；`renew(id,owner,token)`；`assert_lease(conn,id,owner,token)`；`finish(id,owner,token,result=None, mutate=None)`（mutate(conn) 与结果提交同事务）；`fail(...)`；`defer(...,until,reason)`；`cancel(id)`；`reschedule(id,not_before,bypass_window=False)`；`get(id)`；`list(limit=100, *, conn=None, include_active=False)`。时间为 Unix UTC 秒；claim 结果含 id,kind,resource_id,payload,checkpoint,lease_token,owner,status。checkpoint 通过 `checkpoint(id,owner,token,data,mutate=None)` 原子更新。
 
 `enqueue`、`get`、`list` 和 `cancel` 可接受已有事务 `conn`，业务变更与任务创建／取消可以原子提交。`wait_for_review` 保存人工等待状态；`wake_book(book_id, conn=None)` 优先复用同书已有活动任务或最早等待任务；`resume_waiting(kind,resource_id,conn=None)` 在增加预算后恢复等待任务并保留检查点。依赖任务失败或取消时，依赖方明确失败；大量等待依赖的任务不能遮挡后续可执行任务。
 
 worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrade/password/web/worker/run。
 
+`ACTIVE_STATUSES` 定义排队、运行、窗口等待、人工等待。`active_for`／`enqueue`／`reschedule` 在同一写事务内实现活动任务互斥：同类复用并返回 `reused=true`，教材处理／索引或题目识别／讲解的跨类型冲突抛出 `ConflictError`。`predecessor_id` 仅允许正在完成的同教材 `book_process` 原子创建 `book_index`。`request(kind,specification,create,*,conn=None)` 按序列化请求哈希查重，资源工厂 `create(conn)` 与任务写入同事务，用于搜索和导出；导出的题目版本读取也在同一事务内。`configuration_changed(conn)` 唤醒 `waiting_window` 的时段复核，不更改 `queued` 预约时间，与模型写入／删除共用事务。
+
 ## 模块边界
 
 - ai.py/scheduling.py/worker.py/pipelines.py 提供 ModelProfile、模型调用、限流和任务处理器。任务类型包括 `model_test`、`question_extract`、`question_explain`、`book_process`、`page_recognize`、`book_index`、`suggestion_regenerate`、`search`、`export_pdf`；导出任务调用 export 模块。
+- progress.py 提供 `JobProgress(db,conn).present(job)` 和 `present_jobs(db)`，将内部任务转换为页面可用的精简进度投影；不泄露检查点里的完整协议项、图片或凭据。
 - lexical.py/textbook.py/context.py/retrieval.py 通过 records 存 book/page/node/block/concept/relation/suggestion/redirect 等；专用 FTS/vectors SQL 表由 retrieval.initialize_indexes(conn) 管理。
 - frontend/ 使用 /api 同源接口；生产初始化不写演示数据。独立验收脚本只向隔离目录写入测试样本。
 
@@ -55,3 +58,9 @@ Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时�
 无需嵌入请求的检索同步返回结果数组；配置了嵌入模型的 semantic/hybrid 查询返回 HTTP 202 `{job: ...}`，由 worker 获取查询向量。前端从任务结果 `result.hits` 读取命中，不绕过 worker 直接调用服务商。校对操作组必须提供应用生成的 `operation_group_id`（也接受 `group_id`）；没有 ID 明确报错。
 
 GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/exports {question_ids,mode:practice|review,include_answer,include_explanation,include_knowledge,blank_lines} 返回job；GET /api/exports/{id} 返回 snapshot/status/url；GET /api/exports/{id}/file 下载。GET /api/export-snapshot/{id}?token=... 供独立导出路由，token限快照；前端 /print/{id}?token=... 使用该接口共用内容渲染，设置 window.__STUDYQUIP_PRINT_READY__ / __STUDYQUIP_PRINT_ERROR__。
+
+所有返回任务的 Web API 统一使用投影：保留 `id/kind/resource_id/status/created_at/updated_at/not_before/attempts/error/result/bypass_window/reused`，增加 `resource_title/book_id/question_ids/blocking/recovering/waiting_reason/progress`；仅搜索任务提供恢复表单所需的 `input`。不再返回内部 `checkpoint/payload/owner/lease_token`。`GET /api/jobs` 包含最近 100 条及更早的全部活动任务。
+
+`progress` 包含可选的 `phase/current_page/total_pages/recognized_pages/processed_pages/review_pages/skipped_pages/pending_pages/blocks/nodes/summarized_nodes/embedding_total/embedding_completed`，以及 `completed_units/completed_stages/usage/active_requests/embedding_activity/last_activity_at`。请求活动字段为 `state/at/attempt/model/revision/role/page`（按来源可缺省）。页数来自当前正式数据；原页内部顺序不进入对外教材引用。用量为已保存响应累计，原始检查点仅供 worker 使用。
+
+前端 `JobsProvider` 在工作台路由外共享状态，写操作通过 `studyquip:jobs-changed` 通知立即合并任务并刷新；轮询间隔集中为 3000 ms。处理按钮在加载／错误／已有活动任务时禁用；任务结束通知对应页面刷新已提交结果，原页编辑保留未保存文本与基础版本。检索从 `input` 和 `result.hits` 恢复。模型记录携带 `revision`，热重载在处理单元／请求边界实施，协议见 ai-runtime.md。

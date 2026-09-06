@@ -119,6 +119,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "内容不存在")
         return record
 
+    def present_job(job: dict[str, Any]) -> dict[str, Any]:
+        from .progress import JobProgress
+
+        with db.read() as conn:
+            return JobProgress(db, conn).present(job)
+
+    def enqueue(
+        kind: str, id: str, body: ScheduleInput, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return present_job(
+            jobs.enqueue(kind, id, payload, not_before=body.timestamp(), bypass_window=body.bypass_window)
+        )
+
     def public_asset(asset: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in asset.items() if key not in {"path", "preview_path"}}
 
@@ -290,17 +303,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/questions/{id}/extract")
     def extract_question(id: str, body: ScheduleInput = Body(default=ScheduleInput())) -> dict[str, Any]:
         require("question", id)
-        return jobs.enqueue(
-            "question_extract", id, not_before=body.timestamp(), bypass_window=body.bypass_window
-        )
+        return enqueue("question_extract", id, body)
 
     @application.post("/api/questions/{id}/explain")
     def explain_question(id: str, body: ScheduleInput = Body(default=ScheduleInput())) -> dict[str, Any]:
         question = require("question", id)
         validate_question(question)
-        return jobs.enqueue(
-            "question_explain", id, not_before=body.timestamp(), bypass_window=body.bypass_window
-        )
+        return enqueue("question_explain", id, body)
 
     @application.get("/api/books")
     def books() -> list[dict[str, Any]]:
@@ -369,7 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/books/{id}/process")
     def process_book(id: str, body: ScheduleInput = Body(default=ScheduleInput())) -> dict[str, Any]:
         require("book", id)
-        return jobs.enqueue("book_process", id, not_before=body.timestamp(), bypass_window=body.bypass_window)
+        return enqueue("book_process", id, body)
 
     @application.get("/api/books/{id}/pages")
     def book_pages(id: str) -> list[dict[str, Any]]:
@@ -426,13 +435,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         page = require("page", page_id)
         if page.get("book_id") != id:
             raise HTTPException(404, "页面不存在")
-        return jobs.enqueue(
-            "page_recognize",
-            page_id,
-            payload={"book_id": id},
-            not_before=body.timestamp(),
-            bypass_window=body.bypass_window,
-        )
+        return enqueue("page_recognize", page_id, body, {"book_id": id})
 
     @application.post("/api/books/{id}/pages/{page_id}/skip")
     def skip_page(id: str, page_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
@@ -497,13 +500,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         suggestion = require("suggestion", suggestion_id)
         if suggestion.get("book_id") != id:
             raise HTTPException(404, "建议不存在")
-        return jobs.enqueue(
-            "suggestion_regenerate",
-            suggestion_id,
-            payload={"book_id": id},
-            not_before=body.timestamp(),
-            bypass_window=body.bypass_window,
-        )
+        return enqueue("suggestion_regenerate", suggestion_id, body, {"book_id": id})
 
     @application.get("/api/books/{id}/blocks/{block_id}/history")
     def block_history(id: str, block_id: str) -> list[dict[str, Any]]:
@@ -536,7 +533,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from .ai import ModelProfile
 
         data = ModelProfile.model_validate(body).model_dump(mode="json")
-        return present_model(db.put("model", data))
+        with db.write() as conn:
+            saved = db.put("model", data, conn=conn)
+            jobs.configuration_changed(conn)
+        return present_model(saved)
 
     @application.put("/api/models/{id}")
     def update_model(id: str, body: dict[str, Any] = Body()) -> dict[str, Any]:
@@ -549,18 +549,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = ModelProfile.model_validate(merged).model_dump(mode="json")
         if body.get("revision") is None:
             raise ValueError("保存时需要配置版本")
-        return present_model(db.put("model", data, id=id, expected_revision=body["revision"]))
+        with db.write() as conn:
+            saved = db.put("model", data, id=id, expected_revision=body["revision"], conn=conn)
+            jobs.configuration_changed(conn)
+        return present_model(saved)
 
     @application.delete("/api/models/{id}")
     def delete_model(id: str) -> dict[str, bool]:
         require("model", id)
-        db.delete("model", id)
+        with db.write() as conn:
+            db.delete("model", id, conn=conn)
+            jobs.configuration_changed(conn)
         return {"deleted": True}
 
     @application.post("/api/models/{id}/test")
     def test_model(id: str, body: ScheduleInput = Body(default=ScheduleInput())) -> dict[str, Any]:
         require("model", id)
-        return jobs.enqueue("model_test", id, not_before=body.timestamp(), bypass_window=body.bypass_window)
+        return enqueue("model_test", id, body)
 
     @application.post("/api/assets")
     async def upload(file: UploadFile = File()) -> dict[str, Any]:
@@ -601,36 +606,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = body.model_dump()
         embedding_models = db.list("model", filters={"role": "embedding"})
         if body.mode in {"semantic", "hybrid"} and embedding_models:
-            request = db.put("search", data)
-            job = jobs.enqueue("search", request["id"])
-            return JSONResponse(status_code=202, content={"job": job})
+            job = jobs.request("search", data, lambda conn: db.put("search", data, conn=conn))
+            return JSONResponse(status_code=202, content={"job": present_job(job)})
         if body.mode == "semantic":
             raise ValueError("请先配置嵌入模型")
         return RetrievalService(db).search(**data)
 
     @application.get("/api/jobs")
     def list_jobs() -> list[dict[str, Any]]:
-        return jobs.list()
+        from .progress import present_jobs
+
+        return present_jobs(db)
 
     @application.post("/api/jobs/{id}/cancel")
     def cancel_job(id: str) -> dict[str, Any]:
-        return jobs.cancel(id)
+        return present_job(jobs.cancel(id))
 
     @application.post("/api/jobs/{id}/retry")
     def retry_job(id: str) -> dict[str, Any]:
         job = jobs.get(id)
         if not job:
             raise HTTPException(404, "任务不存在")
-        return jobs.reschedule(id, time.time(), bool(job["bypass_window"]))
+        return present_job(jobs.reschedule(id, time.time(), bool(job["bypass_window"])))
 
     @application.post("/api/jobs/{id}/reschedule")
     def reschedule_job(id: str, body: ScheduleInput) -> dict[str, Any]:
-        return jobs.reschedule(id, body.timestamp(), body.bypass_window)
+        return present_job(jobs.reschedule(id, body.timestamp(), body.bypass_window))
 
     @application.post("/api/exports")
     def add_export(body: ExportInput) -> dict[str, Any]:
-        snapshot = create_snapshot(db, body)
-        return jobs.enqueue("export_pdf", snapshot["id"])
+        with db.write() as conn:
+            selected = [db.get("question", id, conn=conn) for id in body.question_ids]
+            if any(not question or question.get("deleted") for question in selected):
+                raise ValueError("所选题目不存在")
+            specification = {
+                **body.model_dump(),
+                "revisions": [question["revision"] for question in selected if question],
+            }
+            job = jobs.request(
+                "export_pdf", specification, lambda active: create_snapshot(db, body, active), conn=conn
+            )
+        return present_job(job)
 
     @application.get("/api/exports/{id}")
     def get_export(id: str) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import multiprocessing
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +17,11 @@ from sqlalchemy import select
 from studyquip.api import create_app
 from studyquip.auth import set_password
 from studyquip.config import Settings
-from studyquip.db import Database, file_lock, initialize, jobs_table
+from studyquip.db import ConflictError, Database, file_lock, initialize, jobs_table
 from studyquip.export import public_snapshot
 from studyquip.jobs import JobStore, LeaseLost
 from studyquip.media import crop_asset, safe_path, store_upload
+from studyquip.progress import present_jobs
 from studyquip.schemas import validate_question
 
 
@@ -37,6 +39,15 @@ def _try_lock(path: str, shared: bool, queue: Any) -> None:
             queue.put(True)
     except portalocker.exceptions.LockException:
         queue.put(False)
+
+
+def _enqueue_process(directory: str, barrier: Any, queue: Any) -> None:
+    db = Database(Settings(data_dir=Path(directory)))
+    try:
+        barrier.wait(timeout=15)
+        queue.put(JobStore(db).enqueue("book_process", "book")["id"])
+    finally:
+        db.close()
 
 
 @pytest.fixture
@@ -104,6 +115,64 @@ def test_waiting_dependencies_do_not_starve_ready_jobs(database: Database) -> No
     assert jobs.get(invalid["id"])["status"] == "failed"
 
 
+def test_duplicate_submission_and_progress_survive_refresh_and_expired_lease(database: Database) -> None:
+    database.put("book", {"title": "测试教材"}, id="book")
+    database.put("page", {"book_id": "book", "index": 0, "status": "draft"}, id="page")
+    database.put("page", {"book_id": "book", "index": 1, "status": "pending"})
+    context = multiprocessing.get_context("spawn")
+    barrier, queue = context.Barrier(2), context.Queue()
+    processes = [
+        context.Process(target=_enqueue_process, args=(str(database.settings.data_dir), barrier, queue))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    identifiers = [queue.get(timeout=20) for _ in processes]
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    assert len(set(identifiers)) == 1
+    jobs = JobStore(database)
+    claimed = jobs.claim("worker")
+    assert claimed
+    assert jobs.enqueue("book_process", "book")["id"] == claimed["id"]
+    with pytest.raises(ConflictError):
+        jobs.enqueue("book_index", "book")
+    jobs.checkpoint(
+        claimed["id"],
+        claimed["owner"],
+        claimed["lease_token"],
+        {
+            "phase": "识别教材草稿",
+            "stages": {
+                "recognize:page:1:0": {
+                    "transcript": ["data:image/png;base64,private-fixture"],
+                    "activity": {"state": "requesting", "model": "fixture", "revision": 2},
+                    "usage": {"requests": 1, "input_tokens": 8, "output_tokens": 3},
+                }
+            },
+        },
+    )
+    with database.write() as conn:
+        conn.execute(jobs_table.update().where(jobs_table.c.id == claimed["id"]).values(lease_until=0))
+    # Older active tasks must remain visible beyond the recent-history limit.
+    for index in range(101):
+        item = jobs.enqueue("probe", str(index))
+        jobs.cancel(item["id"])
+    projected = next(item for item in present_jobs(database) if item["id"] == claimed["id"])
+    assert projected["blocking"] and projected["recovering"]
+    assert projected["resource_title"] == "测试教材"
+    assert projected["progress"]["recognized_pages"] == 1
+    assert projected["progress"]["total_pages"] == 2
+    assert projected["progress"]["active_requests"][0]["page"] == 1
+    assert "transcript" not in str(projected) and "private-fixture" not in str(projected)
+    jobs.cancel(claimed["id"])
+    replacement = jobs.enqueue("book_process", "book")
+    with pytest.raises(ConflictError):
+        jobs.reschedule(claimed["id"], 0)
+    assert replacement["id"] != claimed["id"]
+
+
 @pytest.mark.parametrize(
     "parent_shared,child_shared,expected",
     [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
@@ -149,6 +218,23 @@ def test_auth_confirmation_and_snapshot_boundary(database: Database) -> None:
         assert confirmed["answer_confirmed"]
         exported = client.post("/api/exports", json={"question_ids": [question["id"]], "mode": "practice"})
         assert exported.status_code == 200, exported.text
+        duplicate_export = client.post(
+            "/api/exports", json={"question_ids": [question["id"]], "mode": "practice"}
+        )
+        assert duplicate_export.json()["id"] == exported.json()["id"]
+        assert duplicate_export.json()["reused"] is True
+        explanation = client.post(f"/api/questions/{question['id']}/explain", json={}).json()
+        assert (
+            client.post(f"/api/questions/{question['id']}/explain", json={}).json()["id"] == explanation["id"]
+        )
+        assert client.post(f"/api/questions/{question['id']}/extract", json={}).status_code == 409
+        book = client.post(
+            "/api/books", json={"title": "物理", "subject_id": subject["id"], "text": "惯性"}
+        ).json()
+        processing = client.post(f"/api/books/{book['id']}/process", json={}).json()
+        repeated = client.post(f"/api/books/{book['id']}/process", json={}).json()
+        assert repeated["id"] == processing["id"] and repeated["reused"]
+        assert repeated["blocking"] and "checkpoint" not in repeated
         snapshot = database.get("export", exported.json()["resource_id"])
         assert snapshot and snapshot["questions"][0]["answer"] == confirmed["answer"]
         assert (
@@ -203,6 +289,41 @@ def test_auth_confirmation_and_snapshot_boundary(database: Database) -> None:
             ).status_code
             == 403
         )
+
+
+def test_model_edits_recheck_windows_and_search_requests_are_reused(database: Database) -> None:
+    set_password(database, "test-password-only")
+    with TestClient(create_app(database.settings), base_url="http://127.0.0.1:8765") as client:
+        session = client.post("/api/login", json={"password": "test-password-only"}).json()
+        client.headers.update({"X-CSRF-Token": session["csrf_token"]})
+        model = client.post(
+            "/api/models",
+            json={
+                "name": "嵌入",
+                "role": "embedding",
+                "api_key": "fixture",
+                "base_url": "https://fixture.invalid/v1",
+                "model": "fixture",
+            },
+        ).json()
+        first = client.post("/api/search", json={"query": "惯性", "mode": "semantic"}).json()["job"]
+        second = client.post("/api/search", json={"query": "惯性", "mode": "semantic"}).json()["job"]
+        assert second["id"] == first["id"] and second["reused"]
+        assert second["input"]["query"] == "惯性"
+        jobs = JobStore(database)
+        future = time.time() + 86400
+        waiting = jobs.enqueue("model_test", model["id"])
+        scheduled = jobs.enqueue("model_test", "scheduled", not_before=future)
+        with database.write() as conn:
+            conn.execute(
+                jobs_table.update()
+                .where(jobs_table.c.id == waiting["id"])
+                .values(status="waiting_window", not_before=future)
+            )
+        changed = client.put(f"/api/models/{model['id']}", json={**model, "max_concurrency": 16})
+        assert changed.status_code == 200
+        assert jobs.get(waiting["id"])["not_before"] < future
+        assert jobs.get(scheduled["id"])["not_before"] == future
 
 
 def test_exif_and_heif_crop_preserve_original(database: Database) -> None:

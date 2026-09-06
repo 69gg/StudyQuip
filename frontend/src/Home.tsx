@@ -5,12 +5,17 @@ import {
   jobKindLabels,
   questionTypes,
   type Book,
-  type Job,
   type Model,
   type Question,
   type Subject,
 } from "./types";
 import { Badge, Button, State, formatTime, useRemote } from "./ui";
+import {
+  isActiveJob,
+  matchingJobs,
+  useJobCompletion,
+  useJobs,
+} from "./JobProgress";
 import {
   hasActiveTasks,
   homeTasks,
@@ -30,7 +35,13 @@ export default function Home({
   onRefresh: () => void;
 }) {
   const questions = useRemote<Question[]>("/questions", []);
-  const jobs = useRemote<Job[]>("/jobs", []);
+  const taskState = useJobs();
+  const jobs = {
+    data: taskState.jobs,
+    loading: !taskState.ready,
+    error: taskState.error,
+    reload: taskState.reload,
+  };
   const models = useRemote<Model[]>("/models", []);
   const reload = useCallback(() => {
     questions.reload();
@@ -38,6 +49,7 @@ export default function Home({
     models.reload();
     onRefresh();
   }, [questions.reload, jobs.reload, models.reload, onRefresh]);
+  useJobCompletion(jobs.data, reload);
   const active = hasActiveTasks(jobs.data);
 
   useEffect(() => {
@@ -220,11 +232,23 @@ export default function Home({
                 <State error={jobs.error} />
                 <div className="home-task-list">
                   {tasks.map((job) => (
-                    <a className="home-task-row" key={job.id} href="#tasks">
+                    <a
+                      className="home-task-row"
+                      key={job.id}
+                      href={`#tasks?job=${encodeURIComponent(job.id)}`}
+                    >
                       <span className="home-task-title">
                         {jobKindLabels[job.kind] || "处理任务"}
                       </span>
                       <Badge status={job.status} />
+                      {job.progress?.phase && (
+                        <p>
+                          {job.progress.phase}
+                          {job.progress.total_pages
+                            ? ` · 已识别 ${job.progress.recognized_pages} / ${job.progress.total_pages} 页`
+                            : ""}
+                        </p>
+                      )}
                       {(job.defer_reason || job.waiting_reason) && (
                         <p>{job.defer_reason || job.waiting_reason}</p>
                       )}
@@ -263,7 +287,16 @@ export default function Home({
                           )?.name || "未设科目"}
                         </span>
                       </div>
-                      <Badge status={book.status} />
+                      <Badge
+                        status={
+                          matchingJobs(
+                            jobs.data,
+                            book.id,
+                            undefined,
+                            true,
+                          ).find(isActiveJob)?.status || book.status
+                        }
+                      />
                     </a>
                   ))}
                 </div>

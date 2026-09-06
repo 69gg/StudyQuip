@@ -206,8 +206,13 @@ export function ScheduleDialog({
           throw new Error("请选择未来的执行时间。");
         schedule.not_before = parsed / 1000;
       }
-      await onSubmit(schedule);
-      notice("任务已提交，可在任务页查看进度。");
+      const result = (await onSubmit(schedule)) as
+        { reused?: boolean } | undefined;
+      notice(
+        result?.reused
+          ? "已有相同任务，已复用现有进度。"
+          : "任务已提交，可在任务页查看进度。",
+      );
       onClose();
     } catch (e) {
       notice((e as Error).message, true);

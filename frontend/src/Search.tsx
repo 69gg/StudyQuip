@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
-import { api, post } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { post } from "./api";
 import { MathText } from "./Content";
 import type { Book, Job, Subject } from "./types";
-import { Badge, Button, Check, Field, formatTime, useNotice } from "./ui";
+import { Button, Check, Field, useNotice } from "./ui";
+import { useJobs, isActiveJob, JobProgress } from "./JobProgress";
 type SearchHit = {
   id?: string;
   block_id?: string;
@@ -31,32 +32,28 @@ export default function Search({
     [results, setResults] = useState<SearchHit[] | null>(null),
     [job, setJob] = useState<Job | null>(null);
   const notice = useNotice();
+  const tasks = useJobs();
+  const restored = useRef(false);
   useEffect(() => {
-    if (
-      !job ||
-      ["completed", "succeeded", "failed", "cancelled"].includes(job.status)
-    )
-      return;
-    let active = true;
-    const timer = window.setInterval(async () => {
-      try {
-        const list = await api<Job[]>("/jobs");
-        const current = list.find((item) => item.id === job.id);
-        if (!active || !current) return;
-        setJob(current);
-        if (["completed", "succeeded"].includes(current.status)) {
-          const result = current.result as { hits?: SearchHit[] } | undefined;
-          setResults(result?.hits || []);
-        }
-      } catch (error) {
-        if (active) notice((error as Error).message, true);
-      }
-    }, 2500);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [job?.id, job?.status, notice]);
+    if (!tasks.ready) return;
+    const current = job
+      ? tasks.jobs.find((item) => item.id === job.id)
+      : !restored.current
+        ? tasks.jobs.find((item) => item.kind === "search")
+        : undefined;
+    if (!restored.current && current?.input) {
+      setQuery(String(current.input.query || ""));
+      setSubject(String(current.input.subject_id || ""));
+      setSelected((current.input.book_ids || []) as string[]);
+      setMode(String(current.input.mode || "hybrid"));
+      setKeyword(String(current.input.keyword_mode || "any"));
+    }
+    restored.current = true;
+    if (!current) return;
+    setJob(current);
+    if (current.status === "completed")
+      setResults((current.result as { hits?: SearchHit[] })?.hits || []);
+  }, [tasks.jobs, tasks.ready, job?.id]);
   return (
     <>
       <div className="page-heading">
@@ -106,8 +103,15 @@ export default function Search({
             onChange={(e) => setQuery(e.target.value)}
             placeholder="输入知识点、公式或问题…"
           />
-          <Button kind="primary" type="submit" busy={busy}>
-            检索
+          <Button
+            kind="primary"
+            type="submit"
+            busy={busy}
+            disabled={
+              !tasks.ready || !!tasks.error || (!!job && isActiveJob(job))
+            }
+          >
+            {job && isActiveJob(job) ? "检索处理中" : "检索"}
           </Button>
         </div>
         <div className="form-grid three">
@@ -171,30 +175,13 @@ export default function Search({
           </div>
         </details>
       </form>
+      {tasks.error && (
+        <p className="inline-error">暂时无法读取任务状态，请稍后重试。</p>
+      )}
       {job && (
         <div className="gentle-notice">
-          <div className="row-between">
-            <span>语义检索任务</span>
-            <Badge status={job.status} />
-          </div>
-          {job.not_before && job.not_before > Date.now() / 1000 ? (
-            <p>最早执行：{formatTime(job.not_before)}</p>
-          ) : null}
-          {(job.defer_reason || job.waiting_reason) && (
-            <p>{job.defer_reason || job.waiting_reason}</p>
-          )}
-          {job.error ? (
-            <p
-              className={
-                job.status === "waiting_window" ? "hint" : "inline-error"
-              }
-            >
-              {typeof job.error === "string"
-                ? job.error
-                : JSON.stringify(job.error)}
-            </p>
-          ) : null}
-          <p>检索会按模型时段执行，结果完成后在此显示，也可在任务页查看。</p>
+          <JobProgress job={job} />
+          <a href={`#tasks?job=${encodeURIComponent(job.id)}`}>查看任务详情</a>
         </div>
       )}
       {results && (

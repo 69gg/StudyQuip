@@ -1108,6 +1108,90 @@ small,
   padding-top: 20px;
   border-top: 1px solid var(--line);
 }
+.resource-progress {
+  margin-block: 16px 24px;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  min-width: 0;
+}
+.resource-progress > a {
+  display: inline-block;
+  margin-top: 10px;
+  color: var(--accent);
+  font-size: 13px;
+}
+.job-progress {
+  min-width: 0;
+}
+.job-progress p {
+  margin-block: 8px;
+  overflow-wrap: anywhere;
+}
+.job-progress .row-between strong {
+  font-size: 14px;
+  font-weight: 500;
+}
+.progress-meters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+.progress-meters label,
+.embedding-progress {
+  font-size: 13px;
+  display: block;
+}
+.progress-meters label > span {
+  float: right;
+  color: var(--muted);
+}
+.job-progress progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 8px;
+  border: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--line);
+  accent-color: var(--accent);
+}
+.job-progress progress::-webkit-progress-bar {
+  background: var(--line);
+}
+.job-progress progress::-webkit-progress-value {
+  background: var(--accent);
+}
+.task-resource {
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+.request-detail {
+  font-size: 12px;
+  color: var(--muted);
+}
+.task-row.selected-task {
+  border-left: 3px solid var(--accent);
+  padding-left: 16px;
+}
+.model-row:has(.resource-progress) {
+  flex-wrap: wrap;
+}
+.model-row > .resource-progress {
+  flex-basis: 100%;
+  margin-block: 0;
+}
+@media (max-width: 540px) {
+  .progress-meters {
+    grid-template-columns: 1fr;
+  }
+  .resource-progress {
+    padding: 13px;
+  }
+}
 details {
   border-top: 1px solid var(--line);
   padding: 14px 0;

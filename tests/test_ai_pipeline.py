@@ -9,11 +9,12 @@ from typing import Any
 import httpx
 import pytest
 
-from studyquip.ai import AIService
+from studyquip.ai import AIService, ModelProfile
 from studyquip.config import Settings
 from studyquip.db import ConflictError, Database, initialize
 from studyquip.jobs import JobStore
 from studyquip.pipelines import PipelineContext
+from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.worker import Worker
 
@@ -180,6 +181,12 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
     indexed_book = db.get("book", book["id"])
     assert indexed_book and indexed_book["embedding_pending"] is False
     assert RetrievalService(db).search("惯性定律", book_ids=[book["id"]], mode="keyword")
+    search = db.put("search", {"query": "惯性定律", "mode": "semantic", "book_ids": [book["id"]]})
+    search_job = jobs.enqueue("search", search["id"])
+    assert (await run_next())["result"]["hits"]
+    projection = next(item for item in present_jobs(db) if item["id"] == search_job["id"])
+    assert projection["progress"]["usage"] == {"requests": 1, "input_tokens": 10}
+    assert not projection["progress"].get("embedding_activity")
     question = db.put(
         "question",
         {
@@ -268,3 +275,59 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
             await context.finish({"invalid": True})
     assert db.get("marker", "deleted-write") is None
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_embedding_change_restarts_index_in_new_space_without_mislabelling(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, summary_batch_size=1)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        book = db.put("book", {"title": "空间切换测试"})
+        for index in range(2):
+            db.put("block", {"book_id": book["id"], "text": f"正文 {index}", "order": index})
+        configured = db.put(
+            "model",
+            {
+                "name": "embedding",
+                "role": "embedding",
+                "model": "before",
+                "base_url": "https://provider.example/v1",
+                "api_key": "fixture",
+                "embedding_dimensions": 3,
+            },
+        )
+        calls: list[tuple[str, int]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            wire = json.loads(request.content)
+            calls.append((wire["model"], wire["dimensions"]))
+            if len(calls) == 1:
+                db.put(
+                    "model", {**configured, "model": "after", "embedding_dimensions": 4}, id=configured["id"]
+                )
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.5] * wire["dimensions"]}]})
+
+        worker = Worker(settings, db, AIService(db, settings, transport=httpx.MockTransport(respond)))
+        jobs = JobStore(db)
+        task = jobs.enqueue("book_index", book["id"])
+        first = jobs.claim(worker.owner)
+        assert first
+        await worker.execute(first)
+        assert jobs.get(task["id"])["status"] == "waiting_window"
+        resumed = jobs.claim(worker.owner)
+        assert resumed
+        await worker.execute(resumed)
+        assert jobs.get(task["id"])["status"] == "completed"
+        assert calls == [("before", 3), ("after", 4), ("after", 4)]
+        assert (
+            len(
+                RetrievalService(db).existing_embeddings(
+                    book["id"], ModelProfile.model_validate(db.get("model", configured["id"])).model_dump()
+                )
+            )
+            == 2
+        )
+        assert jobs.get(task["id"])["checkpoint"]["embedding_completed"] == 2
+    finally:
+        db.close()
