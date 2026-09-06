@@ -915,7 +915,7 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
             for name, (description, schema, _) in tools.items()
         ),
     ]
-    input_budget = min(profile.context_tokens, ctx.settings.context_tokens)
+    input_budget = profile.effective_context_tokens(ctx.settings.context_tokens)
     # Keep room for the surrounding prompt and at least one subsequent read-tool result.
     # This internal reserve does not become a provider output limit when the field is unset.
     output_reserve = (
@@ -1140,7 +1140,8 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
 
     budget = book.get("extra_processing_budget")
     batch_size = ctx.settings.summary_batch_size
-    builder = ContextBuilder(ctx.db, token_budget=min(profile.context_tokens, ctx.settings.context_tokens))
+    input_budget = profile.effective_context_tokens(ctx.settings.context_tokens)
+    builder = ContextBuilder(ctx.db, token_budget=input_budget)
     ordered = sorted(nodes, key=depth, reverse=True)
     pending: list[Json] = []
 
@@ -1212,7 +1213,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
                     *(child.get("summary", "") for child in children if not child.get("summary_stale")),
                 ]
             )
-            units = builder.units(content, budget=max(256, profile.context_tokens // 4)) if content else [""]
+            units = builder.units(content, budget=max(256, input_budget // 4)) if content else [""]
             ready.append((node, fingerprint, len(units)))
             for index, unit in enumerate(units):
                 if await asyncio.to_thread(ctx.db.get, "summary_part", f"{node['id']}:{fingerprint}:{index}"):
@@ -1227,7 +1228,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
                 if pending and (
                     len(pending) >= batch_size
                     or any(entry["node_id"] == node["id"] for entry in pending)
-                    or estimate_tokens([*pending, item]) > profile.context_tokens // 2
+                    or estimate_tokens([*pending, item]) > input_budget // 2
                 ):
                     await run_batch(pending)
                     pending = []
@@ -1241,9 +1242,9 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
                 for index in range(unit_count)
             ]
             summary = "\n".join(part["text"] for part in parts if part)
-            while estimate_tokens(summary) > profile.context_tokens // 4:
+            while estimate_tokens(summary) > input_budget // 4:
                 condensed: list[str] = []
-                for fragment in builder.units(summary, budget=profile.context_tokens // 2):
+                for fragment in builder.units(summary, budget=input_budget // 2):
                     signature = hashlib.sha256(fragment.encode()).hexdigest()
                     result: Summaries = await ctx.structured(
                         f"summary-collapse:{node['id']}:{signature}",
@@ -1287,6 +1288,7 @@ async def book_index(ctx: PipelineContext) -> None:
     if chat:
         await _summarize_nodes(ctx, book, chat)
     if embedding:
+        input_budget = embedding.effective_context_tokens(ctx.settings.context_tokens)
         targets = await asyncio.to_thread(retrieval.embedding_targets, book["id"])
         existing = await asyncio.to_thread(retrieval.existing_embeddings, book["id"], embedding.model_dump())
         batches: list[list[Json]] = []
@@ -1299,8 +1301,7 @@ async def book_index(ctx: PipelineContext) -> None:
             if (
                 not batches
                 or len(batches[-1]) >= ctx.settings.summary_batch_size
-                or estimate_tokens([item["text"] for item in [*batches[-1], target]])
-                > embedding.context_tokens
+                or estimate_tokens([item["text"] for item in [*batches[-1], target]]) > input_budget
             ):
                 batches.append([])
             batches[-1].append({**target, "marker": marker})

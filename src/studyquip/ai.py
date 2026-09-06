@@ -47,7 +47,7 @@ class ModelProfile(BaseModel):
     top_p: float | None = Field(default=None, ge=0, le=1)
     max_output_tokens: int | None = Field(default=None, gt=0)
     max_tokens_field: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
-    context_tokens: int = Field(default=24000, ge=1024)
+    context_tokens: int | None = Field(default=None, ge=1024)
     image_tokens: int = Field(default=2048, gt=0)
     timeout_seconds: float = Field(default=180, gt=0)
     retries: int = Field(default=2, ge=0, le=10)
@@ -68,6 +68,12 @@ class ModelProfile(BaseModel):
     embedding_revision: str = ""
     document_prefix: str = ""
     query_prefix: str = ""
+
+    def effective_context_tokens(self, application_budget: int) -> int:
+        """Resolve the internal budget; it is never a provider request parameter."""
+        if self.context_tokens is None:
+            return application_budget
+        return min(self.context_tokens, application_budget)
 
     @field_validator("base_url")
     @classmethod
@@ -107,6 +113,7 @@ class ModelProfile(BaseModel):
             "max_tokens",
             "max_completion_tokens",
             "max_output_tokens",
+            "context_tokens",
             "thinking",
             "reasoning_effort",
             "temperature",
@@ -418,8 +425,8 @@ class AIService:
             else:
                 params["instructions"] = system
                 params["input"] = [{"role": "user", "content": content}, *transcript]
-            if estimate_tokens(params, profile.image_tokens) > min(
-                profile.context_tokens, self.settings.context_tokens
+            if estimate_tokens(params, profile.image_tokens) > profile.effective_context_tokens(
+                self.settings.context_tokens
             ):
                 raise ContextBudgetExceeded(
                     "完整工具上下文超过输入预算；请缩小页面处理单元，不能裁剪未完成的协议项"

@@ -37,7 +37,7 @@ export default function Models({
       reasoning_effort: null,
       max_output_tokens: null,
       max_tokens_field: "max_completion_tokens",
-      context_tokens: 24000,
+      context_tokens: null,
       timeout_seconds: 120,
       retries: 2,
       max_tool_rounds: 8,
@@ -393,9 +393,9 @@ function ModelEditor({
               {numberField(
                 "context_tokens",
                 "上下文预算（tokens）",
-                "用于请求前的内容预算。",
-                false,
-                1,
+                "留空使用应用统一预算；此项不会发送给模型。",
+                true,
+                1024,
               )}
               {numberField(
                 "max_output_tokens",

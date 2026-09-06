@@ -356,6 +356,14 @@ async def verify(output: Path) -> dict[str, Any]:
                         await page.get_by_role("button", name="关闭窗口", exact=True).click()
                         await page.locator('a[href="#settings"]').click()
                         await page.get_by_role("button", name="＋ 添加模型配置").click()
+                        context_limit = page.get_by_role(
+                            "spinbutton", name=re.compile(r"^上下文预算（tokens）")
+                        )
+                        await expect(context_limit).to_have_value("")
+                        await context_limit.fill("8192")
+                        await context_limit.fill("")
+                        await expect(context_limit).not_to_have_attribute("required", "")
+                        report["optional_context_limit"] = "默认空值、填写与清空、非必填通过"
                         output_limit = page.get_by_role("spinbutton", name=re.compile(r"^最大输出（tokens）"))
                         output_field = page.get_by_role("combobox", name="输出长度字段", exact=True)
                         await expect(output_limit).to_have_value("")

@@ -36,14 +36,43 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
             "base_url": "https://provider.example/v1",
             "api_key": "fixture",
             "model": "fixture",
+            "context_tokens": None,
         },
     )
+    db.put(
+        "model",
+        {
+            "name": "mock embedding",
+            "role": "embedding",
+            "base_url": "https://provider.example/v1",
+            "api_key": "fixture",
+            "model": "fixture-embedding",
+            "context_tokens": None,
+            "embedding_dimensions": 3,
+        },
+    )
+    embedding_inputs: list[list[str]] = []
     explanation_inputs: list[dict[str, Any]] = []
     original_reason = "当时把定律名字记混了，我好像没记牢。"
     optimized_reason = "我当时混淆了定律的名称，可能还没有记牢。"
 
     def respond(request: httpx.Request) -> httpx.Response:
         wire = json.loads(request.content)
+        assert "context_tokens" not in wire
+        if request.url.path.endswith("/embeddings"):
+            embedding_inputs.append(wire["input"])
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "model": "fixture-embedding",
+                    "data": [
+                        {"object": "embedding", "index": index, "embedding": [1.0, 0.5, 0.25]}
+                        for index in range(len(wire["input"]))
+                    ],
+                    "usage": {"prompt_tokens": 10, "total_tokens": 10},
+                },
+            )
         prompt = wire["messages"][1]["content"][0]["text"]
         if "按原始顺序把当前教材草稿" in prompt:
             result: dict[str, Any] = {
@@ -147,6 +176,9 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
     assert records(db, "page", {"book_id": book["id"]})[0]["status"] == "processed"
     assert len(records(db, "block", {"book_id": book["id"]})) == 1
     await run_next()  # Index job is enqueued in the book completion transaction.
+    assert embedding_inputs
+    indexed_book = db.get("book", book["id"])
+    assert indexed_book and indexed_book["embedding_pending"] is False
     assert RetrievalService(db).search("惯性定律", book_ids=[book["id"]], mode="keyword")
     question = db.put(
         "question",

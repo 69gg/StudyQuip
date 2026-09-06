@@ -9,7 +9,7 @@ import httpx
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from studyquip.ai import AIProtocolError, AIService, ModelProfile, request_parameters
+from studyquip.ai import AIProtocolError, AIService, ContextBudgetExceeded, ModelProfile, request_parameters
 from studyquip.config import Settings
 
 
@@ -49,6 +49,7 @@ def test_parameter_mapping_and_extra_conflicts(thinking: str) -> None:
         {"model": "override"},
         {"thinking": {"type": "disabled"}},
         {"tool_choice": "auto"},
+        {"context_tokens": 4096},
         {"reasoning": {"effort": "low"}},
     ):
         with pytest.raises(ValidationError):
@@ -84,6 +85,7 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
         thinking="enabled",
         reasoning_effort="max",
         max_tokens_field=max_tokens_field,
+        context_tokens=None if tool_choice == "omit" else 8192,
         **output_configuration,
     )
     requests: list[dict[str, Any]] = []
@@ -95,6 +97,7 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
         else:
             assert wire["tool_choice"] == tool_choice
         assert wire["tools"]
+        assert "context_tokens" not in wire
         assert wire["thinking"] == {"type": "enabled"}
         output_fields = {"max_tokens", "max_completion_tokens", "max_output_tokens"}
         limit = output_configuration.get("max_output_tokens")
@@ -213,6 +216,35 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
 def test_maximum_output_rejects_nonpositive_limits(limit: int) -> None:
     with pytest.raises(ValidationError, match="max_output_tokens"):
         profile(max_output_tokens=limit)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configuration,expected",
+    [
+        ({}, 8192),
+        ({"context_tokens": None}, 8192),
+        ({"context_tokens": 4096}, 4096),
+        ({"context_tokens": 16384}, 8192),
+    ],
+)
+async def test_context_budget_inherits_global_limit_and_rejects_before_request(
+    configuration: dict[str, int | None], expected: int
+) -> None:
+    configured = profile(**configuration)
+    assert configured.context_tokens == configuration.get("context_tokens")
+    assert configured.effective_context_tokens(8192) == expected
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("超出内部预算的请求不应发送给服务商")
+
+    ai = AIService(
+        FakeProfiles([configured]),
+        Settings(context_tokens=8192),
+        transport=httpx.MockTransport(unexpected_request),
+    )
+    with pytest.raises(ContextBudgetExceeded):
+        await ai.structured(configured, "测" * (expected * 2), Result)
 
 
 @pytest.mark.asyncio

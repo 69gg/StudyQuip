@@ -71,7 +71,7 @@ export type Model = Entity & {
   top_p?: number | null;
   max_output_tokens: number | null;
   max_tokens_field: "max_completion_tokens" | "max_tokens";
-  context_tokens: number;
+  context_tokens: number | null;
   timeout_seconds: number;
   retries: number;
   max_tool_rounds: number;
