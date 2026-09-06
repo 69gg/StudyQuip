@@ -48,6 +48,7 @@ def test_parameter_mapping_and_extra_conflicts(thinking: str) -> None:
     for invalid in (
         {"model": "override"},
         {"thinking": {"type": "disabled"}},
+        {"tool_choice": "auto"},
         {"reasoning": {"effort": "low"}},
     ):
         with pytest.raises(ValidationError):
@@ -55,13 +56,33 @@ def test_parameter_mapping_and_extra_conflicts(thinking: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol,store", [("responses", False), ("responses", True), ("chat", False)])
-async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(protocol: str, store: bool) -> None:
-    configured = profile(protocol=protocol, store=store)
+@pytest.mark.parametrize(
+    "protocol,store,tool_choice",
+    [
+        ("responses", False, "required"),
+        ("responses", True, "required"),
+        ("chat", False, "required"),
+        ("responses", False, "omit"),
+        ("chat", False, "omit"),
+        ("chat", False, "auto"),
+    ],
+)
+async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
+    protocol: str, store: bool, tool_choice: str
+) -> None:
+    configured = profile(
+        protocol=protocol, store=store, tool_choice=tool_choice, thinking="enabled", reasoning_effort="max"
+    )
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         wire = json.loads(request.content)
+        if tool_choice == "omit":
+            assert "tool_choice" not in wire
+        else:
+            assert wire["tool_choice"] == tool_choice
+        assert wire["tools"]
+        assert wire["thinking"] == {"type": "enabled"}
         requests.append(wire)
         final = len(requests) > 1
         name, arguments = ("submit_result", '{"answer":"完成"}') if final else ("read", '{"id":"block"}')

@@ -33,6 +33,7 @@ export default function Models({
       base_url: "",
       model: "",
       thinking: "omit",
+      tool_choice: "required",
       reasoning_effort: null,
       max_output_tokens: 4096,
       max_tokens_field: "max_completion_tokens",
@@ -336,6 +337,24 @@ function ModelEditor({
                   <option value="omit">不发送，使用服务商默认值</option>
                   <option value="enabled">开启</option>
                   <option value="disabled">关闭</option>
+                </select>
+              </Field>
+              <Field
+                label="工具选择策略"
+                hint="DeepSeek 思考模式请选择不发送；应用仍会校验工具返回结构。"
+              >
+                <select
+                  value={model.tool_choice ?? "required"}
+                  onChange={(e) =>
+                    update(
+                      "tool_choice",
+                      e.target.value as Model["tool_choice"],
+                    )
+                  }
+                >
+                  <option value="required">强制调用工具（required）</option>
+                  <option value="auto">由模型选择（auto）</option>
+                  <option value="omit">不发送（服务商默认）</option>
                 </select>
               </Field>
               <Field

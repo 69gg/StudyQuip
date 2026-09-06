@@ -10,6 +10,10 @@ Chat 使用 `reasoning_effort`、所选 `max_completion_tokens`／`max_tokens`�
 
 生成必须调用 `submit_result`，由 Pydantic 验证。服务商支持时可开启 strict；第一版默认关闭以兼容第三方服务商。strict 开启后固定字段工具转换为严格 JSON Schema。格式不符仅允许一次带错误反馈的修复，自由文本不会作为结构化业务结果保存。
 
+工具选择策略由模型配置的 `tool_choice` 显式决定：`required`（默认）强制调用工具，`auto` 交给模型选择，`omit` 完全不发送此参数；三者都发送工具定义，并要求通过 `submit_result` 和应用侧结构校验。未调用工具时仍然报错，不把自由文本当作结果。服务商返回参数错误时不自动回退或修改配置。
+
+DeepSeek V4 思考模式使用 `thinking=enabled`、`reasoning_effort=max` 和 `max_tokens`。其思考模式不接受强制 `tool_choice`，应在表单中显式选择“不发送（服务商默认）”；Chat 续接仍完整保留助手消息的 `reasoning_content`。此设置适用于按 OpenAI 格式接入的官方端点，不能通过删除 thinking 来绕过错误。[官方思考模式说明](https://api-docs.deepseek.com/guides/thinking_mode/)、[官方工具选择兼容说明](https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/)
+
 Responses 无状态循环保存完整输出项，包括推理加密内容、消息 phase、工具调用及其 ID。后续请求按顺序回传完整项和工具结果；缺少必要推理加密内容时停止无状态续接。`store=true` 用 `item_reference` 引用有服务端 ID 的输出项，不同时回传同一项全文。Chat 保留完整 assistant 消息及第三方的 `reasoning_content`。
 
 每个阶段将输出项、待执行读取工具、轮数、校验修复次数及用量写入任务检查点。窗口关闭后可以从已有工具结果继续；阶段最终结果已持久化时不会再次调用模型。中断恰好发生在服务商返回与本地检查点提交之间，仍可能产生一次重复请求费用。

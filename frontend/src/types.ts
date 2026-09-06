@@ -65,6 +65,7 @@ export type Model = Entity & {
   has_api_key?: boolean;
   model: string;
   thinking: "omit" | "enabled" | "disabled";
+  tool_choice?: "required" | "auto" | "omit";
   reasoning_effort?: string | null;
   temperature?: number | null;
   top_p?: number | null;

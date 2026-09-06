@@ -52,6 +52,7 @@ class ModelProfile(BaseModel):
     timeout_seconds: float = Field(default=180, gt=0)
     retries: int = Field(default=2, ge=0, le=10)
     max_tool_rounds: int = Field(default=8, ge=1)
+    tool_choice: Literal["required", "auto", "omit"] = "required"
     max_concurrency: int = Field(default=4, ge=1)
     credential_max_concurrency: int | None = Field(default=None, ge=1)
     store: bool = False
@@ -404,7 +405,8 @@ class AIService:
                 )
             params = request_parameters(profile)
             params["tools"] = definitions
-            params["tool_choice"] = "required"
+            if profile.tool_choice != "omit":
+                params["tool_choice"] = profile.tool_choice
             if profile.protocol == "chat":
                 params["messages"] = [
                     {"role": "system", "content": system},

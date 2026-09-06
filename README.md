@@ -48,6 +48,8 @@ worker 负责全部模型请求、模型连接测试、后台教材处理和 PDF
 
 ## 模型、时间窗口与并发
 
+DeepSeek V4 开启思考时，工具选择策略设为“不发送（服务商默认）”，输出长度字段使用 `max_tokens`；需要较高思考强度时填写 `max`。应用仍要求模型通过工具提交结构化结果。[具体协议与参数说明](docs/ai-runtime.md)
+
 视觉和讲解模型支持 Chat Completions、Responses，嵌入模型使用 Embeddings API。所有结构化输出经过工具调用及应用校验。
 
 - 思考扩展分为“不发送 / enabled / disabled”；`thinking` 是特定服务商扩展，使用 OpenAI 官方接口时默认不发送。
