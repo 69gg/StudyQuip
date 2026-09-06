@@ -69,7 +69,7 @@ export type Model = Entity & {
   reasoning_effort?: string | null;
   temperature?: number | null;
   top_p?: number | null;
-  max_output_tokens: number;
+  max_output_tokens: number | null;
   max_tokens_field: "max_completion_tokens" | "max_tokens";
   context_tokens: number;
   timeout_seconds: number;

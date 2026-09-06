@@ -35,7 +35,7 @@ export default function Models({
       thinking: "omit",
       tool_choice: "required",
       reasoning_effort: null,
-      max_output_tokens: 4096,
+      max_output_tokens: null,
       max_tokens_field: "max_completion_tokens",
       context_tokens: 24000,
       timeout_seconds: 120,
@@ -400,8 +400,8 @@ function ModelEditor({
               {numberField(
                 "max_output_tokens",
                 "最大输出（tokens）",
-                undefined,
-                false,
+                "留空不发送，使用服务商默认上限。",
+                true,
                 1,
               )}
             </div>
@@ -409,6 +409,7 @@ function ModelEditor({
               <Field label="输出长度字段">
                 <select
                   value={model.max_tokens_field}
+                  disabled={model.max_output_tokens == null}
                   onChange={(e) =>
                     update(
                       "max_tokens_field",

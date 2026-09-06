@@ -45,7 +45,7 @@ class ModelProfile(BaseModel):
     reasoning_effort: str | None = None
     temperature: float | None = None
     top_p: float | None = Field(default=None, ge=0, le=1)
-    max_output_tokens: int = Field(default=4096, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
     max_tokens_field: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     context_tokens: int = Field(default=24000, ge=1024)
     image_tokens: int = Field(default=2048, gt=0)
@@ -136,11 +136,13 @@ def request_parameters(profile: ModelProfile) -> Json:
         if value is not None:
             params[field] = value
     if profile.protocol == "chat":
-        params[profile.max_tokens_field] = profile.max_output_tokens
+        if profile.max_output_tokens is not None:
+            params[profile.max_tokens_field] = profile.max_output_tokens
         if profile.reasoning_effort is not None:
             params["reasoning_effort"] = profile.reasoning_effort
     else:
-        params["max_output_tokens"] = profile.max_output_tokens
+        if profile.max_output_tokens is not None:
+            params["max_output_tokens"] = profile.max_output_tokens
         params["store"] = profile.store
         if profile.reasoning_effort is not None:
             params["reasoning"] = {"effort": profile.reasoning_effort}

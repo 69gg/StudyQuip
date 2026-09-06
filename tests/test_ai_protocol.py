@@ -57,21 +57,34 @@ def test_parameter_mapping_and_extra_conflicts(thinking: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "protocol,store,tool_choice",
+    "protocol,store,tool_choice,max_tokens_field,output_configuration",
     [
-        ("responses", False, "required"),
-        ("responses", True, "required"),
-        ("chat", False, "required"),
-        ("responses", False, "omit"),
-        ("chat", False, "omit"),
-        ("chat", False, "auto"),
+        ("responses", False, "required", "max_completion_tokens", {}),
+        ("responses", True, "required", "max_completion_tokens", {"max_output_tokens": 2048}),
+        ("chat", False, "required", "max_completion_tokens", {}),
+        ("responses", False, "omit", "max_completion_tokens", {"max_output_tokens": None}),
+        ("chat", False, "omit", "max_tokens", {"max_output_tokens": None}),
+        ("chat", False, "auto", "max_tokens", {"max_output_tokens": 2048}),
+        ("chat", False, "required", "max_completion_tokens", {"max_output_tokens": None}),
+        ("chat", False, "required", "max_completion_tokens", {"max_output_tokens": 2048}),
+        ("chat", False, "required", "max_tokens", {}),
     ],
 )
 async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
-    protocol: str, store: bool, tool_choice: str
+    protocol: str,
+    store: bool,
+    tool_choice: str,
+    max_tokens_field: str,
+    output_configuration: dict[str, int | None],
 ) -> None:
     configured = profile(
-        protocol=protocol, store=store, tool_choice=tool_choice, thinking="enabled", reasoning_effort="max"
+        protocol=protocol,
+        store=store,
+        tool_choice=tool_choice,
+        thinking="enabled",
+        reasoning_effort="max",
+        max_tokens_field=max_tokens_field,
+        **output_configuration,
     )
     requests: list[dict[str, Any]] = []
 
@@ -83,6 +96,14 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
             assert wire["tool_choice"] == tool_choice
         assert wire["tools"]
         assert wire["thinking"] == {"type": "enabled"}
+        output_fields = {"max_tokens", "max_completion_tokens", "max_output_tokens"}
+        limit = output_configuration.get("max_output_tokens")
+        expected_output = (
+            {max_tokens_field if protocol == "chat" else "max_output_tokens": limit}
+            if limit is not None
+            else {}
+        )
+        assert {key: wire[key] for key in output_fields & wire.keys()} == expected_output
         requests.append(wire)
         final = len(requests) > 1
         name, arguments = ("submit_result", '{"answer":"完成"}') if final else ("read", '{"id":"block"}')
@@ -186,6 +207,12 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
     # A persisted completed stage resumes without spending a second model call.
     assert (await ai.structured(configured, "test", Result, state=state)).answer == "完成"
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_maximum_output_rejects_nonpositive_limits(limit: int) -> None:
+    with pytest.raises(ValidationError, match="max_output_tokens"):
+        profile(max_output_tokens=limit)
 
 
 @pytest.mark.asyncio

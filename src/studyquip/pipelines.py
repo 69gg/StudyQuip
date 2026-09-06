@@ -917,8 +917,12 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
     ]
     input_budget = min(profile.context_tokens, ctx.settings.context_tokens)
     # Keep room for the surrounding prompt and at least one subsequent read-tool result.
+    # This internal reserve does not become a provider output limit when the field is unset.
+    output_reserve = (
+        profile.max_output_tokens if profile.max_output_tokens is not None else ctx.settings.output_tokens
+    )
     builder = ContextBuilder(
-        ctx.db, token_budget=max(2048, input_budget - min(profile.max_output_tokens, input_budget // 4))
+        ctx.db, token_budget=max(2048, input_budget - min(output_reserve, input_budget // 4))
     )
     service = TextbookService(ctx.db)
     unit_index = 0

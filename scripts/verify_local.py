@@ -356,6 +356,16 @@ async def verify(output: Path) -> dict[str, Any]:
                         await page.get_by_role("button", name="关闭窗口", exact=True).click()
                         await page.locator('a[href="#settings"]').click()
                         await page.get_by_role("button", name="＋ 添加模型配置").click()
+                        output_limit = page.get_by_role("spinbutton", name=re.compile(r"^最大输出（tokens）"))
+                        output_field = page.get_by_role("combobox", name="输出长度字段", exact=True)
+                        await expect(output_limit).to_have_value("")
+                        await expect(output_field).to_be_disabled()
+                        await output_limit.fill("2048")
+                        await expect(output_field).to_be_enabled()
+                        await output_limit.fill("")
+                        await expect(output_limit).not_to_have_attribute("required", "")
+                        await expect(output_field).to_be_disabled()
+                        report["optional_output_limit"] = "默认空值、填写与清空、输出字段启停通过"
                         await page.wait_for_timeout(250)
                         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (
                             "手机模型表单溢出"

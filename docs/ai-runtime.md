@@ -6,13 +6,15 @@
 
 `ModelProfile` 区分 `vision`、`chat`、`embedding` 角色。视觉与讲解角色可选择 `chat` 或 `responses` 协议；角色不参与并发桶身份。未设置的采样／effort 参数不发送。`thinking` 为三态：`omit` 完全省略，另两态作为服务商扩展显式发送。
 
-Chat 使用 `reasoning_effort`、所选 `max_completion_tokens`／`max_tokens`；Responses 使用 `reasoning.effort`、`max_output_tokens`。Responses 显式 `store=false` 为应用默认值。自定义参数不能覆盖消息、工具、模型和专用表单字段；允许通过 `reasoning.summary` 等非冲突子字段补充请求。参数不兼容直接报错，不自动删除参数或切换存储模式。
+Chat 使用 `reasoning_effort`；Responses 使用 `reasoning.effort`。模型的 `max_output_tokens` 为可选正整数，默认 `null`。配置缺省或在表单中清空后，请求完全省略输出上限字段，由服务商采用其默认上限，不发送 JSON `null`；填写正整数时，Chat 映射为所选 `max_completion_tokens`／`max_tokens`，Responses 映射为 `max_output_tokens`。已有配置中的显式数字继续生效，清空并保存即可取消；0 和负数无效。
+
+Responses 显式 `store=false` 为应用默认值。自定义参数不能覆盖消息、工具、模型和专用表单字段，即使最大输出留空也不能在扩展 JSON 中重新设置其协议字段；允许通过 `reasoning.summary` 等非冲突子字段补充请求。参数不兼容直接报错，不自动删除参数或切换存储模式。
 
 生成必须调用 `submit_result`，由 Pydantic 验证。服务商支持时可开启 strict；第一版默认关闭以兼容第三方服务商。strict 开启后固定字段工具转换为严格 JSON Schema。格式不符仅允许一次带错误反馈的修复，自由文本不会作为结构化业务结果保存。
 
 工具选择策略由模型配置的 `tool_choice` 显式决定：`required`（默认）强制调用工具，`auto` 交给模型选择，`omit` 完全不发送此参数；三者都发送工具定义，并要求通过 `submit_result` 和应用侧结构校验。未调用工具时仍然报错，不把自由文本当作结果。服务商返回参数错误时不自动回退或修改配置。
 
-DeepSeek V4 思考模式使用 `thinking=enabled`、`reasoning_effort=max` 和 `max_tokens`。其思考模式不接受强制 `tool_choice`，应在表单中显式选择“不发送（服务商默认）”；Chat 续接仍完整保留助手消息的 `reasoning_content`。此设置适用于按 OpenAI 格式接入的官方端点，不能通过删除 thinking 来绕过错误。[官方思考模式说明](https://api-docs.deepseek.com/guides/thinking_mode/)、[官方工具选择兼容说明](https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/)
+DeepSeek V4 思考模式使用 `thinking=enabled`、`reasoning_effort=max`；若指定输出上限，字段选择 `max_tokens`，留空则不发送。其思考模式不接受强制 `tool_choice`，应在表单中显式选择“不发送（服务商默认）”；Chat 续接仍完整保留助手消息的 `reasoning_content`。此设置适用于按 OpenAI 格式接入的官方端点，不能通过删除 thinking 来绕过错误。[官方思考模式说明](https://api-docs.deepseek.com/guides/thinking_mode/)、[官方工具选择兼容说明](https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/)
 
 Responses 无状态循环保存完整输出项，包括推理加密内容、消息 phase、工具调用及其 ID。后续请求按顺序回传完整项和工具结果；缺少必要推理加密内容时停止无状态续接。`store=true` 用 `item_reference` 引用有服务端 ID 的输出项，不同时回传同一项全文。Chat 保留完整 assistant 消息及第三方的 `reasoning_content`。
 
@@ -37,6 +39,8 @@ worker 收到 SIGTERM（Windows 启动器使用进程组 CTRL_BREAK_EVENT／SIGB
 同一本教材的正式修订／索引在 worker 内互斥，页识别草稿可以并行。每个正式处理单元使用当前草稿、有限近邻、目录祖先和工作记忆，工具定义一并计入预算。`current_node_id` 与滚动摘要随操作组提交；节点必须在本次完整模拟后的目录内。操作组回执与 `completed_units` 在同一事务写入，防止中断后重复插入或重复建立概念。
 
 请求预算与教材上下文共用离线估算函数：文本／JSON 采用 UTF-8 字节数的保守预算，图片按模型配置的 `image_tokens` 预留。它不是模型的精确计费 token 数；实际用量以服务商响应为准。首次请求不会下载 tokenizer 文件，避免额外网络依赖或阻塞任务心跳。
+
+教材上下文仍需为输出预留容量：未设置模型输出上限时，使用 `Settings.output_tokens`（默认 4096）作为应用内部预留预算；该预算不补写模型配置，也不作为 API 输出上限发送。省略输出参数不表示无限输出，实际仍受服务商默认值和模型上下文限制。
 
 概述按内容指纹缓存，按目录深度自底向上处理。同层多个节点可合为一次请求，默认每批最多 8 个节点；长内容先分段，概述仍过长时逐层压缩，不将整本前文塞进一个请求。概述未缩短时停止额外调用。`extra_processing_budget` 限制该索引任务成功返回的概述请求数，每轮请求前检查；网络失败是否由服务商收费无法由本地用量确定。正文及 FTS 已提交后，即使预算耗尽仍可使用。
 
