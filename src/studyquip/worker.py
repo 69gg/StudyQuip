@@ -112,12 +112,13 @@ class Worker:
         active: set[asyncio.Task[None]] = set()
         try:
             while not stop.is_set():
-                active = {task for task in active if not task.done()}
-                while len(active) < self.settings.max_active_jobs and not stop.is_set():
+                while not stop.is_set():
                     job = await asyncio.to_thread(self.jobs.claim, self.owner)
                     if job is None:
                         break
-                    active.add(asyncio.create_task(self.execute(job)))
+                    task = asyncio.create_task(self.execute(job))
+                    active.add(task)
+                    task.add_done_callback(active.discard)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self.settings.worker_poll_seconds)
                 except TimeoutError:

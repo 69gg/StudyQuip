@@ -6,7 +6,7 @@
 
 包：`studyquip`，源码位于 `src/studyquip`。所有 Python 函数添加类型注释。
 
-`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、context_tokens=24000、output_tokens=4096、max_upload_mb=100、worker_poll_seconds=1、max_active_jobs=8、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。
+`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、context_tokens=24000、output_tokens=4096、max_upload_mb=100、worker_poll_seconds=1、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。
 
 `db.Database(settings)` 持有 rw/ro SQLAlchemy engine。`write()` 是返回 Connection 的短事务 context manager；`read()` 是只读 Connection context manager。`get(kind, id, conn=None)` 返回 dict 或 None；`list(kind, *, filters=None, limit=1000, offset=0, conn=None)` 返回 dict 列表，filters 对 data JSON 顶层字段精确比较。`put(kind, data, *, id=None, expected_revision=None, conn=None)` 返回带 id/revision/created_at/updated_at 的 dict；存在时未提供 expected_revision 视为调用方已在同一写事务锁定，外部修改必须明确传版本。`delete(kind,id,*,conn=None)`。`history(kind,id,conn=None)` 返回旧/现版本列表。`secret()` 返回持久化 bytes。`ConflictError` 表示版本冲突。records 表为(kind,id,revision,data JSON,created_at,updated_at)，history 保存每次版本。
 
@@ -17,6 +17,8 @@
 `enqueue`、`get`、`list` 和 `cancel` 可接受已有事务 `conn`，业务变更与任务创建／取消可以原子提交。`wait_for_review` 保存人工等待状态；`wake_book(book_id, conn=None)` 优先复用同书已有活动任务或最早等待任务；`resume_waiting(kind,resource_id,conn=None)` 在增加预算后恢复等待任务并保留检查点。依赖任务失败或取消时，依赖方明确失败；大量等待依赖的任务不能遮挡后续可执行任务。
 
 worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrade/password/web/worker/run。
+
+worker 持有在途协程的强引用，完成回调释放引用，退出时取消并等待剩余任务。不限制在途任务数量；`book_process` 通过 `asyncio.gather` 并行识别草稿并按原输入顺序收集结果，不再设置单书页数信号量。所有模型请求仍经 `CapacityLimiter` 原子检查模型和凭据上限，正式跨页修订仍顺序执行。`max_active_jobs` 已从 `Settings` 移除。
 
 `ACTIVE_STATUSES` 定义排队、运行、窗口等待、人工等待。`active_for`／`enqueue`／`reschedule` 在同一写事务内实现活动任务互斥：同类复用并返回 `reused=true`，教材处理／索引或题目识别／讲解的跨类型冲突抛出 `ConflictError`。`predecessor_id` 仅允许正在完成的同教材 `book_process` 原子创建 `book_index`。`request(kind,specification,create,*,conn=None)` 按序列化请求哈希查重，资源工厂 `create(conn)` 与任务写入同事务，用于搜索和导出；导出的题目版本读取也在同一事务内。`configuration_changed(conn)` 唤醒 `waiting_window` 的时段复核，不更改 `queued` 预约时间，与模型写入／删除共用事务。
 

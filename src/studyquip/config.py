@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     context_tokens: int = Field(24000, ge=2048)
     output_tokens: int = Field(4096, ge=128)
     max_upload_mb: int = Field(100, ge=1)
-    max_active_jobs: int = Field(8, ge=1)
     worker_poll_seconds: float = Field(1, gt=0)
     frontend_dir: Path = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     session_hours: int = Field(24, ge=1)

@@ -1072,13 +1072,7 @@ async def book_process(ctx: PipelineContext) -> None:
     await ctx.commit({"phase": "准备教材原页"})
     pages = await _prepare_pages(ctx, book)
     await ctx.commit({"phase": "识别教材草稿"})
-    draft_limit = asyncio.Semaphore(ctx.settings.max_active_jobs)
-
-    async def recognize(page: Json) -> Json:
-        async with draft_limit:
-            return await recognize_page(ctx, page)
-
-    outputs = await asyncio.gather(*(recognize(page) for page in pages), return_exceptions=True)
+    outputs = await asyncio.gather(*(recognize_page(ctx, page) for page in pages), return_exceptions=True)
     for output in outputs:
         if isinstance(output, BaseException):
             raise output

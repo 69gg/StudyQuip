@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from studyquip.jobs import JobStore
 from studyquip.pipelines import PipelineContext
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
+from studyquip.textbook import TextbookService
 from studyquip.worker import Worker
 
 
@@ -330,4 +332,125 @@ async def test_embedding_change_restarts_index_in_new_space_without_mislabelling
         )
         assert jobs.get(task["id"])["checkpoint"]["embedding_completed"] == 2
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workload", ["queued_jobs", "book_pages"])
+async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_limit(
+    tmp_path: Path, workload: str
+) -> None:
+    settings = Settings(data_dir=tmp_path, worker_poll_seconds=0.01)
+    initialize(settings)
+    db = Database(settings)
+    jobs = JobStore(db)
+    limit, count = 12, 16
+    profile = ModelProfile(
+        base_url="https://provider.example/v1",
+        api_key="fixture",
+        model="concurrency-fixture",
+        max_concurrency=limit,
+    )
+    release, saturated, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    active, peak = 0, 0
+    revision_order: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        wire = json.loads(request.content)
+        if wire["model"] == "revision-fixture":
+            prompt = wire["messages"][1]["content"][0]["text"]
+            revision_order.append(json.loads(prompt.split("\n", 1)[1])["current_page"]["id"])
+            result: dict[str, Any] = {"operations": [], "reason": "并发验收", "working_summary": "已校对"}
+        else:
+            active += 1
+            peak = max(peak, active)
+            if active == limit:
+                saturated.set()
+            try:
+                await release.wait()
+            finally:
+                active -= 1
+            result = {"ok": True} if workload == "queued_jobs" else {"text": "识别草稿", "quality": "good"}
+        return httpx.Response(
+            200,
+            json={
+                "id": "fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": wire["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "submit",
+                                    "type": "function",
+                                    "function": {"name": "submit_result", "arguments": json.dumps(result)},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+    worker = Worker(settings, db, AIService(db, settings, transport=httpx.MockTransport(respond)))
+    page_ids: list[str] = []
+    if workload == "queued_jobs":
+        for _ in range(count):
+            model = db.put("model", profile.model_dump())
+            jobs.enqueue("model_test", model["id"])
+        execution = asyncio.create_task(worker.run(stop))
+    else:
+        db.put("model", profile.model_copy(update={"role": "vision"}).model_dump())
+        db.put("model", profile.model_copy(update={"model": "revision-fixture"}).model_dump())
+        book = db.put("book", {"title": "并行页识别验收", "asset_ids": []})
+        TextbookService(db).ensure_root(book["id"])
+        for index in range(count):
+            page = db.put(
+                "page",
+                {
+                    "book_id": book["id"],
+                    "index": index,
+                    "page_index": index,
+                    "source_type": "image",
+                    "source_asset_id": "fixture-source",
+                    "status": "pending",
+                },
+            )
+            page_ids.append(page["id"])
+        jobs.enqueue("book_process", book["id"])
+        claimed = jobs.claim(worker.owner)
+        assert claimed is not None
+        execution = asyncio.create_task(worker._dispatch(claimed))
+    try:
+        # Hold actual SDK transport responses: both paths must exceed the old ceiling
+        # before any request completes, while the configured model cap still applies.
+        await asyncio.wait_for(saturated.wait(), 10)
+        assert peak == limit
+        release.set()
+        if workload == "queued_jobs":
+            async with asyncio.timeout(15):
+                while True:
+                    states = await asyncio.to_thread(jobs.list)
+                    assert all(job["status"] != "failed" for job in states), states
+                    if all(job["status"] == "completed" for job in states):
+                        break
+                    await asyncio.sleep(0.01)
+            stop.set()
+        await asyncio.wait_for(execution, 15)
+        assert peak == limit and active == 0
+        assert not any(worker.ai.limiter._models.values())
+        if workload == "book_pages":
+            assert revision_order == page_ids
+            assert all(db.get("page", page_id)["status"] == "processed" for page_id in page_ids)
+    finally:
+        release.set()
+        stop.set()
+        execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
         db.close()

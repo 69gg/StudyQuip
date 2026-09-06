@@ -26,7 +26,6 @@ CI 配置包含 Linux、Windows、macOS 的运行时与后端测试，但配置�
 | ALLOWED_ORIGINS | [] | 显式额外来源，JSON 数组；本机默认地址始终允许 |
 | LEASE_SECONDS / HEARTBEAT_SECONDS | 90 / 15 | 在途任务租约及续租间隔 |
 | BUSY_TIMEOUT_MS | 5000 | SQLite 锁等待 |
-| MAX_ACTIVE_JOBS | 8 | worker 同时在途任务数量，区别于模型请求并发 |
 | WORKER_POLL_SECONDS | 1 | 队列轮询间隔 |
 | MAX_UPLOAD_MB / MAX_PDF_PAGES | 100 / 2000 | 单文件及 PDF 页数限制 |
 | MAX_IMAGE_PIXELS | 80000000 | 单图像／渲染像素限制 |
@@ -42,6 +41,8 @@ CI 配置包含 Linux、Windows、macOS 的运行时与后端测试，但配置�
 | SUMMARY_BATCH_SIZE | 8 | 节点概述批量上限 |
 
 全部变量添加 `STUDYQUIP_` 前缀。模型的窗口、时区、两级并发、输出长度和额外处理预算在 Web UI 配置；同模型桶的冲突并发上限取较小值。
+
+worker 认领可执行任务、教材页草稿并行识别不再额外限制为 8 个。模型请求只由配置中的模型桶及可选凭据总并发控制；原件准备、正文顺序修订和任务依赖仍按各自流程执行。旧版 `STUDYQUIP_MAX_ACTIVE_JOBS` 已移除，旧 `.env` 中残留的这一项会被忽略，可直接删除；它不会继续限制请求。
 
 Web UI 中的模型配置支持热重载。保存后，新的处理单元、教材下一页／下一次概述调用／下一批嵌入读取最新值；已经发出的请求和同一工具调用链继续使用原模型、凭据、协议与生成参数。并发、窗口、超时及重试在后续请求中刷新；已等待窗口的任务重新判断时间，不提前用户的未来预约。应用级 `.env`、监听地址、数据目录和全局预算仍需重新启动进程。完整生效边界见 [AI 运行协议](ai-runtime.md#模型配置热重载)。
 
