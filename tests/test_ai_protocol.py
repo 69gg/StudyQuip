@@ -225,20 +225,17 @@ def test_maximum_output_rejects_nonpositive_limits(limit: int) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "configuration,expected",
+    "configuration",
     [
-        ({}, 8192),
-        ({"context_tokens": None}, 8192),
-        ({"context_tokens": 4096}, 4096),
-        ({"context_tokens": 16384}, 8192),
+        {},
+        {"context_tokens": None},
+        {"context_tokens": 4096},
+        {"context_tokens": 16384},
     ],
 )
-async def test_processing_budget_is_separate_from_optional_request_limit(
-    configuration: dict[str, int | None], expected: int
-) -> None:
+async def test_context_limit_is_only_applied_when_explicit(configuration: dict[str, int | None]) -> None:
     configured = profile(**configuration)
     assert configured.context_tokens == configuration.get("context_tokens")
-    assert configured.effective_context_tokens(8192) == expected
 
     requests: list[dict[str, Any]] = []
 
@@ -272,10 +269,10 @@ async def test_processing_budget_is_separate_from_optional_request_limit(
 
     ai = AIService(
         FakeProfiles([configured]),
-        Settings(context_tokens=8192),
+        Settings(),
         transport=httpx.MockTransport(respond),
     )
-    # The complete request exceeds the material budget, but fits an explicit 16k limit.
+    # Only an explicitly configured ceiling can prevent a request.
     if configured.context_tokens == 4096:
         with pytest.raises(ContextBudgetExceeded, match="4,096"):
             await ai.structured(configured, "测" * 3500, Result)
@@ -428,7 +425,10 @@ async def test_invalid_result_repairs_once_and_does_not_accept_free_text() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol", ["chat", "responses"])
-async def test_hot_reload_pins_tool_loop_and_rebuilds_only_unfinished_unit(protocol: str) -> None:
+@pytest.mark.parametrize("change", ["configuration", "schema"])
+async def test_hot_reload_pins_tool_loop_and_rebuilds_only_unfinished_unit(
+    protocol: str, change: str
+) -> None:
     configured = profile(id="editable", revision=1, protocol=protocol)
     profiles = FakeProfiles([configured])
     requests: list[dict[str, Any]] = []
@@ -490,16 +490,19 @@ async def test_hot_reload_pins_tool_loop_and_rebuilds_only_unfinished_unit(proto
 
     async def read(arguments: dict[str, Any]) -> dict[str, str]:
         interrupted.update(copy.deepcopy(state))
-        profiles.profiles = [
-            configured.model_copy(
-                update={
-                    "revision": 2,
-                    "model": "new-model",
-                    "protocol": "responses" if protocol == "chat" else "chat",
-                    "api_key": "replacement-key",
-                }
-            )
-        ]
+        if change == "configuration":
+            profiles.profiles = [
+                configured.model_copy(
+                    update={
+                        "revision": 2,
+                        "model": "new-model",
+                        "protocol": "responses" if protocol == "chat" else "chat",
+                        "api_key": "replacement-key",
+                        "thinking": "enabled",
+                        "reasoning_effort": "high",
+                    }
+                )
+            ]
         return {"text": "当前原文"}
 
     ai = AIService(profiles, Settings(), transport=httpx.MockTransport(respond))
@@ -507,15 +510,23 @@ async def test_hot_reload_pins_tool_loop_and_rebuilds_only_unfinished_unit(proto
     assert (await ai.structured(configured, "初始单元", Result, tools=tools, state=state)).answer == "完成"
     assert [wire["model"] for wire in requests] == [configured.model, configured.model]
     assert "replacement-key" not in str(state) and configured.api_key not in str(state)
+    if change == "schema":
+        tools = {"read": ("更新后的读取协议", {"type": "object", "properties": {}}, read)}
     # Resuming a partially persisted unit rebuilds it instead of sending old reasoning/tool items to another API.
     assert (
         await ai.structured(configured, "初始单元", Result, tools=tools, state=interrupted)
     ).answer == "完成"
-    assert requests[-1]["model"] == "new-model"
-    assert ("input" in requests[-1]) is (protocol == "chat")
+    if change == "configuration":
+        assert requests[-1]["model"] == "new-model"
+        assert requests[-1]["thinking"] == {"type": "enabled"}
+        assert requests[-1].get("reasoning_effort", requests[-1].get("reasoning", {}).get("effort")) == "high"
+        assert ("input" in requests[-1]) is (protocol == "chat")
+    else:
+        assert requests[-1]["model"] == configured.model
+        assert "更新后的读取协议" in json.dumps(requests[-1]["tools"], ensure_ascii=False)
     assert "old-envelope" not in json.dumps(requests[-1])
     assert interrupted["configuration_restarts"] == 1
-    assert interrupted["binding"]["revision"] == 2
+    assert interrupted["binding"]["revision"] == (2 if change == "configuration" else 1)
     call_count = len(requests)
     await ai.structured(configured, "已完成单元", Result, state=state)
     assert len(requests) == call_count  # Completed business units stay cached.

@@ -117,6 +117,20 @@ class TextbookService:
             raise ValueError("页面不属于此教材")
         return self.db.put("page", {**page, "text": text, "status": status}, id=page_id, conn=conn)
 
+    def restore_review_page(self, book_id: str, page_id: str, conn: Connection) -> dict[str, Any]:
+        page = self.db.get("page", page_id, conn=conn)
+        if not page or page.get("book_id") != book_id:
+            raise ValueError("页面不属于此教材")
+        if page.get("status") != "needs_review":
+            return page
+        text = page.get("text", "")
+        if not page.get("human_edited") and isinstance(page.get("recognition_draft"), str):
+            text = page["recognition_draft"]
+        data = {**page, "text": text, "status": "draft"}
+        data.pop("quality", None)
+        data.pop("issues", None)
+        return self.db.put("page", data, id=page_id, expected_revision=page["revision"], conn=conn)
+
     def skip_page(
         self, book_id: str, page_id: str, reason: str = "用户跳过", conn: Connection | None = None
     ) -> dict[str, Any]:

@@ -111,6 +111,9 @@ class Worker:
         stop = stop or asyncio.Event()
         active: set[asyncio.Task[None]] = set()
         try:
+            restored = await asyncio.to_thread(self.jobs.restore_review_pages)
+            if restored:
+                logger.info("已将 %s 个旧待校对页面恢复为草稿", restored)
             while not stop.is_set():
                 while not stop.is_set():
                     job = await asyncio.to_thread(self.jobs.claim, self.owner)

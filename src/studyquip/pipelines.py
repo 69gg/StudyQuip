@@ -9,7 +9,6 @@ import json
 import time
 import uuid
 from collections.abc import Callable
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -74,9 +73,9 @@ class OptimizedExplanationDraft(ExplanationDraft):
 
 
 class PageDraft(Structured):
+    # Older checkpoints include quality/issues; they no longer control recognition or acceptance.
+    model_config = ConfigDict(extra="ignore")
     text: str
-    quality: Literal["good", "uncertain", "unusable"]
-    issues: list[str] = Field(default_factory=list)
     is_blank: bool = False
 
 
@@ -398,7 +397,11 @@ async def question_extract(ctx: PipelineContext) -> None:
 
 
 def retrieval_tools(
-    ctx: PipelineContext, book_ids: list[str], subject_id: str | None = None
+    ctx: PipelineContext,
+    book_ids: list[str],
+    subject_id: str | None = None,
+    *,
+    context_tokens: int | None = None,
 ) -> dict[str, tuple[str, Json, ToolHandler]]:
     from studyquip.retrieval import RetrievalService, records
 
@@ -541,7 +544,7 @@ def retrieval_tools(
         end = int(args.get("end") or len(block["text"]))
         if end < start or end > len(block["text"]):
             raise ValueError("正文范围无效")
-        if estimate_tokens(block["text"][start:end]) > ctx.settings.context_tokens // 4:
+        if context_tokens is not None and estimate_tokens(block["text"][start:end]) > context_tokens:
             raise ValueError("正文范围过长，请指定更小的 Unicode 码点区间")
         result = {**block, "text": block["text"][start:end], "range_start": start, "range_end": end}
         if args.get("neighbors"):
@@ -627,7 +630,7 @@ async def question_explain(ctx: PipelineContext) -> None:
     retrieval = RetrievalService(ctx.db)
     with ctx.db.read() as conn:
         book_ids = retrieval.scoped_books(question.get("book_ids") or None, question.get("subject_id"), conn)
-    tools = retrieval_tools(ctx, book_ids, question.get("subject_id"))
+    tools = retrieval_tools(ctx, book_ids, question.get("subject_id"), context_tokens=profile.context_tokens)
     initial = (
         await tools["search_textbook"][2]({"query": question["stem"], "mode": "hybrid"}) if book_ids else []
     )
@@ -809,61 +812,33 @@ async def _prepare_pages(ctx: PipelineContext, book: Json) -> list[Json]:
     return ordered
 
 
-async def _page_images(ctx: PipelineContext, page: Json, remediate: bool = False) -> list[str]:
-    from studyquip.media import image_data_url, render_pdf_page
+async def _page_images(ctx: PipelineContext, page: Json) -> list[str]:
+    from studyquip.media import image_data_url
 
     asset = page.get("image_asset")
-    if remediate and page.get("source_type") == "pdf":
-        original = await asyncio.to_thread(ctx.db.get, "asset", page["source_asset_id"])
-        if original:
-            replacement = await asyncio.to_thread(
-                render_pdf_page, ctx.settings, original, page.get("page_index", 0), 3
-            )
-            asset = replacement.get("image_asset", replacement)
     if not asset and page.get("source_asset_id"):
         asset = await asyncio.to_thread(ctx.db.get, "asset", page["source_asset_id"])
     if not asset:
         return []
-    if not remediate or page.get("source_type") == "pdf":
-        return [await asyncio.to_thread(image_data_url, ctx.settings, asset)]
-
-    def tiles() -> list[str]:
-        import base64
-        import io
-
-        from PIL import Image, ImageOps
-
-        path = Path(asset.get("image_path") or asset.get("path", ""))
-        if not path.is_absolute():
-            path = ctx.settings.files_dir / path
-        result: list[str] = []
-        with Image.open(path) as original:
-            image = ImageOps.exif_transpose(original).convert("RGB")
-            width, height = image.size
-            middle = height // 2
-            for box in (
-                (0, 0, width, min(height, middle + height // 20)),
-                (0, max(0, middle - height // 20), width, height),
-            ):
-                with io.BytesIO() as output:
-                    image.crop(box).save(output, format="PNG")
-                    result.append("data:image/png;base64," + base64.b64encode(output.getvalue()).decode())
-        return result
-
-    return await asyncio.to_thread(tiles)
+    return [await asyncio.to_thread(image_data_url, ctx.settings, asset)]
 
 
 async def recognize_page(ctx: PipelineContext, page: Json, force: bool = False) -> Json:
+    if page.get("status") == "needs_review" and not force:
+        from studyquip.textbook import TextbookService
 
-    if page.get("status") in {"draft", "processed", "skipped", "needs_review"} and not force:
+        return await ctx.commit(
+            mutate=lambda conn: TextbookService(ctx.db).restore_review_page(page["book_id"], page["id"], conn)
+        )
+    if page.get("status") in {"draft", "processed", "skipped"} and not force:
         return page
     original_text = page.get("original_text", page.get("text", ""))
     if page.get("source_type") == "text":
-        result = PageDraft(text=original_text, quality="good")
+        result = PageDraft(text=original_text)
     else:
         profile = await ctx.ai.profile_for("vision")
         prompt = (
-            "将这一页教材忠实整理成连续文章，保留标题、正文、例题、侧栏、tips 和补充知识。用明确的‘插图描述’说明可见图像，不补造看不到的信息。多栏按阅读顺序整理，目录条目逐条保留。空白页可以 text 为空且 is_blank=true；图像页不能仅因文字少判为失败。乱码、截断或明显缺失时标记 uncertain/unusable。不要跨页修订，本轮只做草稿。\n可提取的原始文字参考："
+            "将这一页教材忠实整理成连续文章，保留标题、正文、例题、侧栏、tips 和补充知识。用明确的‘插图描述’说明可见图像，不补造看不到的信息。多栏按阅读顺序整理，目录条目逐条保留。空白页可以 text 为空且 is_blank=true。只提取本页可见内容，页尾句子未结束是正常跨页；保留原文断句，不添加缺失或截断的判断，不猜补后续内容。本轮只做草稿，跨页续接由后续整理处理。\n可提取的原始文字参考："
             + original_text
         )
         result = await ctx.structured(
@@ -873,32 +848,20 @@ async def recognize_page(ctx: PipelineContext, page: Json, force: bool = False) 
             PageDraft,
             await _page_images(ctx, page),
         )
-        if result.quality != "good":
-            result = await ctx.structured(
-                f"recognize:{page['id']}:{page['revision']}:1",
-                profile,
-                prompt
-                + "\n这是一次改变输入的补救识别。前次问题："
-                + json.dumps(result.issues, ensure_ascii=False),
-                PageDraft,
-                await _page_images(ctx, page, True),
-            )
 
     def save(conn: Connection) -> Json:
         current = ctx.db.get("page", page["id"], conn=conn)
         if not current or current["revision"] != page["revision"]:
             raise ConflictError("页面在识别期间已被修改")
-        status = "draft" if result.quality == "good" else "needs_review"
         payload = {
             **current,
-            "quality": result.quality,
-            "issues": result.issues,
             "is_blank": result.is_blank,
-            "status": status,
+            "status": "draft",
+            "text": result.text,
             "recognition_draft": result.text,
         }
-        if result.quality == "good":
-            payload["text"] = result.text
+        payload.pop("quality", None)
+        payload.pop("issues", None)
         return ctx.db.put("page", payload, id=page["id"], expected_revision=page["revision"], conn=conn)
 
     return await ctx.commit(mutate=save)
@@ -923,7 +886,7 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
     from studyquip.textbook import TextbookService
 
     profile = await ctx.ai.refresh_profile(profile)
-    tools = retrieval_tools(ctx, [book["id"]])
+    tools = retrieval_tools(ctx, [book["id"]], context_tokens=profile.context_tokens)
     definitions = [
         tool_definition("submit_result", "提交教材修订结果", RevisionDraft.model_json_schema(), profile),
         *(
@@ -931,7 +894,7 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
             for name, (description, schema, _) in tools.items()
         ),
     ]
-    input_budget = profile.effective_context_tokens(ctx.settings.context_tokens)
+    input_budget = profile.context_tokens
     # Keep room for the surrounding prompt and at least one subsequent read-tool result.
     # This internal reserve does not become a provider output limit when the field is unset.
     output_reserve = (
@@ -942,19 +905,25 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
     # A model/settings edit must not move boundaries underneath completed unit indices.
     builder = ContextBuilder(
         ctx.db,
-        token_budget=plan.get(
-            "context_budget", max(2048, input_budget - min(output_reserve, input_budget // 4))
+        token_budget=(
+            max(512, input_budget - min(output_reserve, input_budget // 4))
+            if input_budget is not None
+            else None
         ),
     )
     service = TextbookService(ctx.db)
     unit_index = 0
+    unit_budget = plan.get("unit_budget")
+    if plan and unit_budget is None:
+        # A saved null means one whole-page unit, even if a later model has an explicit budget.
+        unit_budget = estimate_tokens(page.get("text", ""))
     first_context = await asyncio.to_thread(
         builder.build,
         book["id"],
         page["id"],
         tools=definitions,
         unit_index=0,
-        unit_budget=plan.get("unit_budget"),
+        unit_budget=unit_budget,
     )
     unit_budget = first_context["current_page"]["unit_budget"]
     if not plan:
@@ -1098,8 +1067,6 @@ async def book_process(ctx: PipelineContext) -> None:
     for page in outputs:
         if page["status"] in {"processed", "skipped"}:
             continue
-        if page["status"] == "needs_review":
-            raise NeedsReview(f"教材第 {page.get('index', 0) + 1} 个输入页需要重新识别、校对或跳过")
         await ctx.commit({"phase": "顺序修订教材", "current_page": page.get("index", 0) + 1})
         await _revise_page(ctx, book, page, await ctx.ai.profile_for("chat"))
 
@@ -1121,9 +1088,7 @@ async def page_recognize(ctx: PipelineContext) -> None:
     page = await asyncio.to_thread(ctx.db.get, "page", ctx.job["resource_id"])
     if not page:
         raise ValueError("页面不存在")
-    result = await recognize_page(ctx, page, force=True)
-    if result["status"] == "needs_review":
-        raise NeedsReview("重新识别后仍需人工处理；已保留原正式内容")
+    await recognize_page(ctx, page, force=True)
 
     def resume(conn: Connection) -> None:
         ctx.jobs.wake_book(page["book_id"], conn=conn)
@@ -1184,7 +1149,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
 
     budget = book.get("extra_processing_budget")
     batch_size = ctx.settings.summary_batch_size
-    input_budget = profile.effective_context_tokens(ctx.settings.context_tokens)
+    input_budget = profile.context_tokens
     builder = ContextBuilder(ctx.db, token_budget=input_budget)
     ordered = sorted(nodes, key=depth, reverse=True)
     pending: list[Json] = []
@@ -1196,7 +1161,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
         if budget is not None and requests >= budget:
             raise NeedsReview("教材额外概述预算已用完；已完成正文和关键词索引可继续使用，增加预算后可继续")
         signature = hashlib.sha256(
-            json.dumps([(item["node_id"], item["source_fp"], item["unit_index"]) for item in batch]).encode()
+            json.dumps([(item["node_id"], item["source_fp"], item["unit_id"]) for item in batch]).encode()
         ).hexdigest()
         prompt = (
             "为这些教材目录节点的原文或子节点概述生成简短概述，仅用于检索路由，不当作原文证据。不添加材料没有的概念。返回每个 node_id 的概述。\n"
@@ -1223,7 +1188,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
                         "unit_index": item["unit_index"],
                         "text": summaries[item["node_id"]],
                     },
-                    id=f"{item['node_id']}:{item['source_fp']}:{item['unit_index']}",
+                    id=item["unit_id"],
                     conn=conn,
                 )
 
@@ -1233,7 +1198,7 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
     for original in ordered:
         levels.setdefault(depth(original), []).append(original)
     for level in sorted(levels, reverse=True):
-        ready: list[tuple[Json, str, int]] = []
+        ready: list[tuple[Json, str, list[str]]] = []
         for original in levels[level]:
             node = await asyncio.to_thread(ctx.db.get, "node", original["id"])
             if not node:
@@ -1257,22 +1222,26 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
                     *(child.get("summary", "") for child in children if not child.get("summary_stale")),
                 ]
             )
-            units = builder.units(content, budget=max(256, input_budget // 4)) if content else [""]
-            ready.append((node, fingerprint, len(units)))
-            for index, unit in enumerate(units):
-                if await asyncio.to_thread(ctx.db.get, "summary_part", f"{node['id']}:{fingerprint}:{index}"):
+            units = builder.units(content, budget=max(256, input_budget // 4) if input_budget else None)
+            unit_ids = [
+                f"{node['id']}:{fingerprint}:{hashlib.sha256(unit.encode()).hexdigest()}" for unit in units
+            ]
+            ready.append((node, fingerprint, unit_ids))
+            for index, (unit, unit_id) in enumerate(zip(units, unit_ids, strict=True)):
+                if await asyncio.to_thread(ctx.db.get, "summary_part", unit_id):
                     continue
                 item = {
                     "node_id": node["id"],
                     "title": node["title"],
                     "source_fp": fingerprint,
                     "unit_index": index,
+                    "unit_id": unit_id,
                     "text": unit,
                 }
                 if pending and (
                     len(pending) >= batch_size
                     or any(entry["node_id"] == node["id"] for entry in pending)
-                    or estimate_tokens([*pending, item]) > input_budget // 2
+                    or (input_budget is not None and estimate_tokens([*pending, item]) > input_budget // 2)
                 ):
                     await run_batch(pending)
                     pending = []
@@ -1280,13 +1249,10 @@ async def _summarize_nodes(ctx: PipelineContext, book: Json, profile: ModelProfi
         await run_batch(pending)
         pending = []
         # Publish one depth at a time so parent fingerprints see completed child summaries.
-        for node, fingerprint, unit_count in ready:
-            parts = [
-                await asyncio.to_thread(ctx.db.get, "summary_part", f"{node['id']}:{fingerprint}:{index}")
-                for index in range(unit_count)
-            ]
+        for node, fingerprint, unit_ids in ready:
+            parts = [await asyncio.to_thread(ctx.db.get, "summary_part", unit_id) for unit_id in unit_ids]
             summary = "\n".join(part["text"] for part in parts if part)
-            while estimate_tokens(summary) > input_budget // 4:
+            while input_budget is not None and estimate_tokens(summary) > input_budget // 4:
                 condensed: list[str] = []
                 for fragment in builder.units(summary, budget=input_budget // 2):
                     signature = hashlib.sha256(fragment.encode()).hexdigest()
@@ -1335,7 +1301,7 @@ async def book_index(ctx: PipelineContext) -> None:
     profiles = await ctx.ai.profiles()
     embedding = next((profile for profile in profiles if profile.role == "embedding"), None)
     if embedding:
-        input_budget = embedding.effective_context_tokens(ctx.settings.context_tokens)
+        input_budget = embedding.context_tokens
         targets = await asyncio.to_thread(retrieval.embedding_targets, book["id"])
         existing = await asyncio.to_thread(retrieval.existing_embeddings, book["id"], embedding.model_dump())
         batches: list[list[Json]] = []
@@ -1348,7 +1314,10 @@ async def book_index(ctx: PipelineContext) -> None:
             if (
                 not batches
                 or len(batches[-1]) >= ctx.settings.summary_batch_size
-                or estimate_tokens([item["text"] for item in [*batches[-1], target]]) > input_budget
+                or (
+                    input_budget is not None
+                    and estimate_tokens([item["text"] for item in [*batches[-1], target]]) > input_budget
+                )
             ):
                 batches.append([])
             batches[-1].append({**target, "marker": marker})
@@ -1440,7 +1409,11 @@ async def suggestion_regenerate(ctx: PipelineContext) -> None:
         + json.dumps({"previous_suggestion": suggestion, "outline": nodes}, ensure_ascii=False)
     )
     draft: RevisionDraft = await ctx.structured(
-        "suggestion_regenerate", profile, prompt, RevisionDraft, tools=retrieval_tools(ctx, [book_id])
+        "suggestion_regenerate",
+        profile,
+        prompt,
+        RevisionDraft,
+        tools=retrieval_tools(ctx, [book_id], context_tokens=profile.context_tokens),
     )
     group_id = ctx.data.get("group_id") or str(uuid.uuid4())
     await ctx.commit({"group_id": group_id})

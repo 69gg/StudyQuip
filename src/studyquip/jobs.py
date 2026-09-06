@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.engine import Connection
 
-from .db import ConflictError, Database, jobs_table
+from .db import ConflictError, Database, jobs_table, records
 
 Mutation = Callable[[Connection], Any]
 ACTIVE_STATUSES = ("queued", "running", "waiting_window", "waiting_review")
@@ -51,6 +51,43 @@ class JobStore:
     @staticmethod
     def now(conn: Connection) -> float:
         return float(conn.scalar(select(func.unixepoch("subsec"))))
+
+    def restore_review_pages(self) -> int:
+        """启动时转换旧页面状态；每页短事务，保留任务检查点与人工文本。"""
+        from .textbook import TextbookService
+
+        with self.db.read() as conn:
+            identifiers = list(
+                conn.scalars(
+                    select(records.c.id).where(
+                        records.c.kind == "page", records.c.data["status"].as_string() == "needs_review"
+                    )
+                )
+            )
+        restored = 0
+        for page_id in identifiers:
+            with self.db.write() as conn:
+                page = self.db.get("page", page_id, conn=conn)
+                if not page or page.get("status") != "needs_review":
+                    continue
+                book = self.db.get("book", page.get("book_id", ""), conn=conn)
+                if not book or book.get("deleted"):
+                    continue
+                TextbookService(self.db).restore_review_page(book["id"], page_id, conn)
+                # Only unblock the legacy page-quality wait, not operation conflicts or user budgets.
+                reason = f"教材第 {page.get('index', 0) + 1} 个输入页需要重新识别、校对或跳过"
+                conn.execute(
+                    jobs_table.update()
+                    .where(
+                        jobs_table.c.kind == "book_process",
+                        jobs_table.c.resource_id == book["id"],
+                        jobs_table.c.status == "waiting_review",
+                        jobs_table.c.error == reason,
+                    )
+                    .values(status="queued", error=None, updated_at=self.now(conn))
+                )
+                restored += 1
+        return restored
 
     def active_for(
         self, kind: str, resource_id: str, conn: Connection, exclude_id: str | None = None

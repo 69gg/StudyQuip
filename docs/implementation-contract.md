@@ -6,7 +6,7 @@
 
 包：`studyquip`，源码位于 `src/studyquip`。所有 Python 函数添加类型注释。
 
-`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、context_tokens=24000、output_tokens=4096、max_upload_mb=100、worker_poll_seconds=1、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。
+`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、output_tokens=4096、max_upload_mb=100、worker_poll_seconds=1、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。应用级 `context_tokens` 已删除，旧 `STUDYQUIP_CONTEXT_TOKENS` 被忽略；上下文仅由各模型的可空配置决定。
 
 `db.Database(settings)` 持有 rw/ro SQLAlchemy engine。`write()` 是返回 Connection 的短事务 context manager；`read()` 是只读 Connection context manager。`get(kind, id, conn=None)` 返回 dict 或 None；`list(kind, *, filters=None, limit=1000, offset=0, conn=None)` 返回 dict 列表，filters 对 data JSON 顶层字段精确比较。`put(kind, data, *, id=None, expected_revision=None, conn=None)` 返回带 id/revision/created_at/updated_at 的 dict；存在时未提供 expected_revision 视为调用方已在同一写事务锁定，外部修改必须明确传版本。`delete(kind,id,*,conn=None)`。`history(kind,id,conn=None)` 返回旧/现版本列表。`secret()` 返回持久化 bytes。`ConflictError` 表示版本冲突。records 表为(kind,id,revision,data JSON,created_at,updated_at)，history 保存每次版本。
 
@@ -18,9 +18,11 @@
 
 `resume(id,not_before,bypass_window=False)` 复用原任务和检查点，接受失败／取消／待人工处理状态；对于已在队列、运行或等待时段的同一任务幂等返回，不改变预约和租约。`POST /api/jobs/{id}/resume` 与兼容 `/retry` 接收可选 `ScheduleInput`，修复旧重试接口忽略预约请求体的行为。`resume_problem` 与执行层共用来源指纹，恢复前拒绝互斥任务、已删除来源及输入修改，已完成任务不能恢复。无需数据库迁移。
 
-模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。配置变化重建未完成工具链时一起清除此输入快照。兼容旧检查点：缺少该字段时只补建初始输入，已有 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 固定该草稿版本的材料预算与实际单元预算，防止恢复时配置变化让已完成单元索引对应到不同文本。
+模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 
 worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrade/password/web/worker/run。
+
+`Worker.run()` 在认领前调用 `JobStore.restore_review_pages()->int`，逐页短事务恢复未删除教材的 `needs_review` 页面。`TextbookService.restore_review_page(book_id,page_id,conn)` 保留人工编辑，否则采用已有 AI 候选，无候选保留当前文本；转为 `draft` 并移除旧质量字段，历史仍递增。只有旧页面质量等待被重新排队，不改变预约、检查点或其他终态。识别入口复用同一转换；新 `PageDraft{text:string,is_blank:boolean=false}` 兼容忽略旧 `quality/issues`，识别成功即存草稿，无质量补救请求。
 
 worker 持有在途协程的强引用，完成回调释放引用，退出时取消并等待剩余任务。不限制在途任务数量；`book_process` 通过 `asyncio.gather` 并行识别草稿并按原输入顺序收集结果，不再设置单书页数信号量。所有模型请求仍经 `CapacityLimiter` 原子检查模型和凭据上限，正式跨页修订仍顺序执行。`max_active_jobs` 已从 `Settings` 移除。
 
@@ -57,9 +59,9 @@ POST /api/assets multipart file；GET /api/assets/{id}/file 与 /preview；POST 
 
 Model 另有 `tool_choice:required|auto|omit`，默认 `required`；`omit` 完全不发送工具选择参数。该字段同时适用于 Chat Completions 与 Responses，仍发送工具定义并校验结构化结果。旧模型记录由服务端补默认值，无需架构迁移。
 
-Model 的 `max_output_tokens:int|null` 默认 `null`；前端新增配置默认为空，清空后提交 `null`。服务端拒绝 0／负数，缺省或 `null` 时完全省略请求中的 `max_completion_tokens`、`max_tokens` 和 `max_output_tokens`，不会发送值为 `null` 的字段；正整数按协议及 `max_tokens_field` 映射。已保存的显式上限保留，旧记录缺少此字段时按 `null` 处理，无需架构迁移。教材上下文未配置输出上限时仅以 `Settings.output_tokens` 预留内部预算，不将该预留值作为模型请求参数。
+Model 的 `max_output_tokens:int|null` 默认 `null`；前端新增配置默认为空，清空后提交 `null`。服务端拒绝 0／负数，缺省或 `null` 时完全省略请求中的 `max_completion_tokens`、`max_tokens` 和 `max_output_tokens`，不会发送值为 `null` 的字段；正整数按协议及 `max_tokens_field` 映射。已保存的显式上限保留，旧记录缺少此字段时按 `null` 处理，无需架构迁移。仅在显式填写上下文预算而最大输出留空时，以 `Settings.output_tokens` 预留内部预算，不将预留值作为模型请求参数。
 
-Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时留空，清空后提交 `null`，填写时最小为 1024。该字段不映射到 Chat Completions、Responses 或 Embeddings 请求，也禁止通过 `extra_body` 发送。完整结构化请求只检查用户显式设置的 `context_tokens`；为空则省略应用侧请求长度检查，超限错误包含保守估算及显式上限。材料分块仍通过 `ModelProfile.effective_context_tokens(application_budget:int)->int`：缺省／`null` 返回应用预算，显式整数返回它与应用预算的较小值。`Settings.context_tokens`（默认 24000）只控制教材修订的初始材料、概述分段／合批及嵌入分批，不是工具续接的隐含上限。已有显式值保留，无需架构迁移；检查点里的思考及工具项不会因此被截断或删除。
+Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时留空，清空后提交 `null`，填写时最小为 1024。该字段不映射到 Chat Completions、Responses 或 Embeddings 请求，也禁止通过 `extra_body` 发送。为空时省略完整请求、材料组装、正文读取及概述／嵌入分批的长度限制；删除 `effective_context_tokens` 的应用预算回退。显式上限才触发材料分段和完整请求检查，报错包含保守估算及设置值；已有显式值保留，无需架构迁移。`ContextBuilder(db,token_budget:int|None=None)` 支持整页无长度限制；`retrieval_tools(...,context_tokens:int|None=None)` 以同一配置限制读取，仍始终验证教材范围及来源版本。完整协议项不被裁剪。
 
 无需嵌入请求的检索同步返回结果数组；配置了嵌入模型的 semantic/hybrid 查询返回 HTTP 202 `{job: ...}`，由 worker 获取查询向量。前端从任务结果 `result.hits` 读取命中，不绕过 worker 直接调用服务商。校对操作组必须提供应用生成的 `operation_group_id`（也接受 `group_id`）；没有 ID 明确报错。
 

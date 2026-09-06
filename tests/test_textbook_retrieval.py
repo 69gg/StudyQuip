@@ -293,6 +293,7 @@ def test_longbook_budget_lossless_units_and_gap(
     builder = ContextBuilder(db, token_budget=4096)
     context = builder.build(book["id"], "p299")
     assert context["token_estimate"] <= 4096
+    assert estimate_tokens(context) + estimate_tokens([]) <= 4096
     assert context["current_page"]["gap_before"]
     assert context["previous_blocks"] == []
     block = next(item for item in service.list_blocks(book["id"]) if "p3" in item["source_page_ids"])
@@ -312,6 +313,19 @@ def test_longbook_budget_lossless_units_and_gap(
             book["id"], page["id"], tools=["新工具定义"], unit_index=index, unit_budget=initial["unit_budget"]
         )["current_page"]
         assert resumed["text"] == original["text"] and resumed["unit_count"] == initial["unit_count"]
+
+    # An empty model setting must also remove material/read limits, including protocol overhead.
+    page = db.get("page", "p299")
+    db.put("page", {**page, "text": long}, id=page["id"])
+    db.put("working_memory", {"summary": long}, id=book["id"])
+    unlimited = ContextBuilder(db)
+    context = unlimited.build(book["id"], page["id"], tools=["工具说明" * 3000])
+    assert context["budget"] is None and context["read_limits"]["max_result_tokens"] is None
+    assert context["token_estimate"] > 24000
+    assert context["current_page"]["unit_count"] == 1 and context["current_page"]["text"] == long
+    assert context["working_memory"]["summary"] == long
+    large_block = next(item for item in service.list_blocks(book["id"]) if "p298" in item["source_page_ids"])
+    assert unlimited.read_block(book["id"], large_block["id"])["text"] == large_block["text"]
 
 
 def test_restore_topology_as_group_creates_new_versions(

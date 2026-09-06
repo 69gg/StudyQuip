@@ -1,4 +1,4 @@
-"""Bounded long-book contexts; persistent summaries never replace source records."""
+"""Page-based contexts with optional, explicitly configured token limits."""
 
 from __future__ import annotations
 
@@ -42,15 +42,19 @@ def node_source_fingerprint(db: Database, node_id: str, conn: Connection | None 
 
 
 class ContextBuilder:
-    def __init__(self, db: Database, token_budget: int = 24000) -> None:
-        if token_budget < 512:
+    def __init__(self, db: Database, token_budget: int | None = None) -> None:
+        if token_budget is not None and token_budget < 512:
             raise ValueError("教材上下文预算过小")
         self.db = db
         self.token_budget = token_budget
 
     def units(self, text: str, budget: int | None = None) -> list[str]:
         """Lossless units: source characters are neither stripped nor discarded."""
-        maximum = budget if budget is not None else max(128, self.token_budget // 4)
+        maximum = budget
+        if maximum is None:
+            if self.token_budget is None:
+                return [text]
+            maximum = max(128, self.token_budget // 4)
         units: list[str] = []
         current = ""
         for paragraph in text.splitlines(keepends=True):
@@ -107,9 +111,10 @@ class ContextBuilder:
                 current_node = node.get("parent_id")
             chain.reverse()
             # Keep access handles for distant ancestors, rather than all full titles.
-            ancestor_budget = self.token_budget // 12
-            while len(chain) > 3 and estimate_tokens(chain) > ancestor_budget:
-                del chain[1]
+            if self.token_budget is not None:
+                ancestor_budget = self.token_budget // 12
+                while len(chain) > 3 and estimate_tokens(chain) > ancestor_budget:
+                    del chain[1]
             adjacent_pages = pages[max(0, position - 2) : position]
             gap = next(
                 (
@@ -142,9 +147,9 @@ class ContextBuilder:
                 and any(block["id"] in item.get("base_revisions", {}) for block in blocks)
             ]
             reserved = estimate_tokens(tools or [])
-            if reserved > self.token_budget // 2:
-                raise ValueError("工具定义超过上下文预算，请减少当前轮次工具")
-            if unit_budget is None:
+            if self.token_budget is not None and reserved >= self.token_budget:
+                raise ValueError("工具定义超过显式上下文预算，请提高或清空模型上下文配置")
+            if unit_budget is None and self.token_budget is not None:
                 unit_budget = min(self.token_budget // 4, max(128, (self.token_budget - reserved) // 3))
             units = self.units(page.get("text", ""), unit_budget)
             if not (0 <= unit_index < len(units)):
@@ -187,21 +192,27 @@ class ContextBuilder:
                 ],
                 "budget": self.token_budget,
                 "read_limits": {
-                    "max_result_tokens": self.token_budget // 5,
+                    "max_result_tokens": self.token_budget,
                     "must_read_latest_before_edit": True,
                 },
             }
 
+            # Include the estimate field itself before checking; do not append a fixed margin afterward.
+            context["token_estimate"] = self.token_budget or 0
+
             def size() -> int:
                 return estimate_tokens(context) + reserved
 
+            def over_budget() -> bool:
+                return self.token_budget is not None and size() > self.token_budget
+
             # Drop optional *whole* units. Never truncate target text, evidence or unfinished calls.
-            if size() > self.token_budget:
+            if over_budget():
                 context["next_page"] = None
-            while context["outline"] and size() > self.token_budget:
+            while context["outline"] and over_budget():
                 context["outline"].pop()
                 context["outline_partial"] = True
-            while context["previous_blocks"] and size() > self.token_budget:
+            while context["previous_blocks"] and over_budget():
                 omitted = context["previous_blocks"].pop(0)
                 context.setdefault("previous_block_handles", []).append(
                     {
@@ -210,7 +221,7 @@ class ContextBuilder:
                         "human_protected": omitted.get("human_protected", False),
                     }
                 )
-            if size() > self.token_budget and context["working_memory"]:
+            if over_budget() and context["working_memory"]:
                 context["working_memory"] = {
                     key: value
                     for key, value in context["working_memory"].items()
@@ -225,11 +236,9 @@ class ContextBuilder:
                     }
                 }
                 context["working_memory_summary_omitted"] = True
-            if size() > self.token_budget:
-                raise ValueError("必要上下文超过预算：请缩小工作记忆或增加模型上下文配置")
-            context["token_estimate"] = size() + 32
-            if context["token_estimate"] > self.token_budget:
-                raise ValueError("上下文预算没有足够协议余量")
+            if over_budget():
+                raise ValueError("必要上下文超过显式预算，请提高或清空模型上下文配置")
+            context["token_estimate"] = size()
             return context
 
     def read_block(
@@ -249,6 +258,6 @@ class ContextBuilder:
             "end": finish,
             "total_codepoints": len(source),
         }
-        if estimate_tokens(result) > self.token_budget // 5:
+        if self.token_budget is not None and estimate_tokens(result) > self.token_budget:
             raise ValueError("正文过长，请使用 start/end 分段读取；坐标单位为 Unicode 码点")
         return result

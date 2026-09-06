@@ -17,6 +17,7 @@ from studyquip.ai import AIService, ModelProfile
 from studyquip.api import create_app
 from studyquip.auth import set_password
 from studyquip.config import Settings
+from studyquip.context import node_source_fingerprint
 from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
 from studyquip.pipelines import PipelineContext
@@ -24,6 +25,95 @@ from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
 from studyquip.worker import Worker
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_restores_legacy_review_pages_without_losing_text_or_schedule(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        jobs = JobStore(db)
+        book = db.put("book", {"title": "旧待校对页"})
+        cases: list[tuple[dict[str, Any], str]] = [
+            ({"text": "PDF 提取字", "recognition_draft": "AI 草稿，下一页续接"}, "AI 草稿，下一页续接"),
+            ({"text": "人工校正", "recognition_draft": "AI 草稿", "human_edited": True}, "人工校正"),
+            ({"text": "旧 PDF 文字", "recognition_draft": "", "is_blank": True}, ""),
+            ({"text": "没有候选时保留已有文字"}, "没有候选时保留已有文字"),
+        ]
+        pages = [
+            db.put(
+                "page",
+                {
+                    **data,
+                    "book_id": book["id"],
+                    "index": index,
+                    "status": "needs_review",
+                    "quality": "uncertain",
+                    "issues": ["页尾截断"],
+                    "original_text": "原件始终保留",
+                },
+            )
+            for index, (data, _) in enumerate(cases)
+        ]
+        checkpoint = {"completed_units": ["already-committed"], "usage": {"requests": 7}}
+        waiting = jobs.enqueue("book_process", book["id"], not_before=time.time() + 3600)
+        other_jobs: list[dict[str, Any]] = []
+        with db.write() as conn:
+            conn.execute(
+                jobs_table.update()
+                .where(jobs_table.c.id == waiting["id"])
+                .values(
+                    status="waiting_review",
+                    error="教材第 1 个输入页需要重新识别、校对或跳过",
+                    checkpoint=checkpoint,
+                )
+            )
+            # Review for other reasons and failed/cancelled jobs still require the user's resume.
+            for status in ("failed", "cancelled", "waiting_review"):
+                other = db.put("book", {"title": status}, conn=conn)
+                db.put("page", {"book_id": other["id"], "status": "needs_review", "text": status}, conn=conn)
+                job = jobs.enqueue("book_process", other["id"], conn=conn)
+                conn.execute(
+                    jobs_table.update()
+                    .where(jobs_table.c.id == job["id"])
+                    .values(status=status, error="另一个需要处理的原因", checkpoint=checkpoint)
+                )
+                other_jobs.append(jobs.get(job["id"], conn=conn))
+        deleted = db.put("book", {"title": "已删除", "deleted": True})
+        untouched = [
+            db.put("page", {"book_id": book["id"], "status": status, "text": status})
+            for status in ("processed", "skipped", "draft")
+        ]
+        untouched.append(db.put("page", {"book_id": deleted["id"], "status": "needs_review"}))
+
+        # Exercise the startup hook in this temporary fixture, with task dispatch disabled.
+        worker = Worker(settings, db)
+        stop = asyncio.Event()
+        stop.set()
+        await worker.run(stop)
+        for page, (_, expected) in zip(pages, cases, strict=True):
+            current = db.get("page", page["id"])
+            assert current["status"] == "draft" and current["text"] == expected
+            assert current["original_text"] == page["original_text"]
+            assert current["revision"] == page["revision"] + 1
+            assert "quality" not in current and "issues" not in current
+            assert db.history("page", page["id"])[0]["text"] == page["text"]
+        resumed = jobs.get(waiting["id"])
+        assert resumed["status"] == "queued" and resumed["error"] is None
+        assert resumed["checkpoint"] == checkpoint and resumed["not_before"] == waiting["not_before"]
+        assert resumed["attempts"] == 0
+        assert all(jobs.get(job["id"]) == job for job in other_jobs)
+        assert all(db.get("page", page["id"]) == page for page in untouched)
+        assert jobs.restore_review_pages() == 0
+        assert all(db.get("page", page["id"])["revision"] == page["revision"] + 1 for page in pages)
+        projected = next(job for job in present_jobs(db) if job["id"] == waiting["id"])
+        assert projected["progress"]["recognized_pages"] == 6
+        assert projected["progress"]["review_pages"] == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -49,7 +139,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
                     "text": f"第 {index + 1} 页正文",
                 },
             )
-            for index, status in enumerate(["processed", "draft", "needs_review"])
+            for index, status in enumerate(["processed", "draft", "skipped"])
         ]
         first_block = db.put(
             "block",
@@ -61,7 +151,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
                 "source_page_ids": [pages[0]["id"]],
             },
         )
-        db.put(
+        configured = db.put(
             "model",
             {
                 "role": "chat",
@@ -84,9 +174,12 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
             if len(requests) == 1:
                 name, arguments = "read_block", {"block_id": first_block["id"]}
             else:
-                assert wire["messages"][2:] == saved_transcript
-                if not legacy_checkpoint:
-                    assert wire["messages"][1] == requests[0]["messages"][1]
+                if legacy_checkpoint:
+                    assert wire["messages"][2:] == saved_transcript
+                else:
+                    assert wire["model"] == "latest-model"
+                    assert wire["reasoning_effort"] == "high"
+                    assert wire["messages"][2:] == []
                 name, arguments = (
                     "submit_result",
                     {
@@ -154,8 +247,17 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
                     jobs_table.update().where(jobs_table.c.id == task["id"]).values(checkpoint=checkpoint)
                 )
         else:
-            # New checkpoints must preserve page units and initial inputs across setting edits.
-            settings.context_tokens *= 2
+            # An obsolete material ceiling must not block a resumed unit; model edits take effect.
+            checkpoint["revision_plans"][f"{pages[1]['id']}:1"]["context_budget"] = 512
+            with db.write() as conn:
+                conn.execute(
+                    jobs_table.update().where(jobs_table.c.id == task["id"]).values(checkpoint=checkpoint)
+                )
+            db.put(
+                "model",
+                {**configured, "model": "latest-model", "reasoning_effort": "high"},
+                id=configured["id"],
+            )
         set_password(db, "fixture-password")
         with TestClient(create_app(settings), base_url="http://127.0.0.1:8765") as client:
             session = client.post("/api/login", json={"password": "fixture-password"}).json()
@@ -178,7 +280,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         assert resumed and resumed["id"] == task["id"] and resumed["lease_token"] != claimed["lease_token"]
         await worker.execute(resumed)
         current = jobs.get(task["id"])
-        assert current and current["status"] == "waiting_review"  # The third page still needs review.
+        assert current and current["status"] == "completed"
         assert len(requests) == 3  # No repeated recognition, first-page revision, or tool read.
         assert db.get("page", pages[0]["id"]) == pages[0]
         assert db.get("block", first_block["id"]) == first_block
@@ -186,10 +288,19 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         assert len(records(db, "block", {"book_id": book["id"]})) == 2
         assert len(current["checkpoint"]["completed_units"]) == 1
         assert current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]["usage"]["requests"] == 2
+        with pytest.raises(ConflictError, match="已结束"):
+            jobs.resume(task["id"], time.time())
+        # Reuse this saved input to check source fencing on a failed task, without dispatching again.
+        for pending in jobs.list():
+            if pending["kind"] == "book_index":
+                jobs.cancel(pending["id"])
+        with db.write() as conn:
+            conn.execute(jobs_table.update().where(jobs_table.c.id == task["id"]).values(status="failed"))
         updated = db.put("book", {**book, "title": "用户修改了教材"}, id=book["id"])
         with pytest.raises(ConflictError, match="输入已修改"):
             jobs.resume(task["id"], time.time())
-        assert not present_jobs(db)[0]["resume"]["available"]
+        projection = next(item for item in present_jobs(db) if item["id"] == task["id"])
+        assert not projection["resume"]["available"]
         assert jobs.get(task["id"])["checkpoint"] == current["checkpoint"]
         db.put("book", {**updated, "deleted": True}, id=book["id"])
         with pytest.raises(ConflictError, match="已删除"):
@@ -457,6 +568,103 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
 
 
 @pytest.mark.asyncio
+async def test_unlimited_summary_and_embedding_batches_do_not_reuse_old_partial_summaries(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        book = db.put("book", {"title": "不设上下文上限"})
+        root = TextbookService(db).ensure_root(book["id"])
+        sources: dict[str, str] = {}
+        for index in range(2):
+            node = db.put("node", {"book_id": book["id"], "parent_id": root["id"], "title": f"课题 {index}"})
+            sources[node["id"]] = f"课题 {index} 的完整内容。" * 1500
+            db.put("block", {"book_id": book["id"], "node_id": node["id"], "text": sources[node["id"]]})
+            fingerprint = node_source_fingerprint(db, node["id"])
+            db.put(
+                "summary_part",
+                {
+                    "book_id": book["id"],
+                    "node_id": node["id"],
+                    "source_fp": fingerprint,
+                    "text": "旧首段概述",
+                },
+                id=f"{node['id']}:{fingerprint}:0",
+            )
+        for role in ("chat", "embedding"):
+            db.put(
+                "model",
+                {
+                    "role": role,
+                    "model": role,
+                    "base_url": "https://fixture.invalid/v1",
+                    "api_key": "fixture",
+                    "context_tokens": None,
+                    "embedding_dimensions": 3,
+                },
+            )
+        summary_inputs: list[list[dict[str, Any]]] = []
+        embedding_inputs: list[list[str]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            wire = json.loads(request.content)
+            if request.url.path.endswith("/embeddings"):
+                embedding_inputs.append(wire["input"])
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"index": i, "embedding": [1.0, 0.5, 0.25]} for i in range(len(wire["input"]))
+                        ]
+                    },
+                )
+            prompt = wire["messages"][1]["content"][0]["text"]
+            batch = json.loads(prompt.split("\n", 1)[1])
+            summary_inputs.append(batch)
+            result = {"summaries": [{"node_id": item["node_id"], "summary": "新完整概述"} for item in batch]}
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "submit",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "submit_result",
+                                            "arguments": json.dumps(result),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                },
+            )
+
+        worker = Worker(settings, db, AIService(db, settings, transport=httpx.MockTransport(respond)))
+        task = worker.jobs.enqueue("book_index", book["id"])
+        claimed = worker.jobs.claim(worker.owner)
+        assert claimed
+        await worker.execute(claimed)
+        finished = worker.jobs.get(task["id"])
+        assert finished["status"] == "completed", finished["error"]
+        assert len(summary_inputs) == 2  # Both complete child texts together, then the root.
+        assert {item["node_id"]: item["text"] for item in summary_inputs[0]} == sources
+        assert all(db.get("node", node_id)["summary"] == "新完整概述" for node_id in sources)
+        assert len(embedding_inputs) == 1
+        assert all(source in embedding_inputs[0] for source in sources.values())
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_embedding_change_restarts_index_in_new_space_without_mislabelling(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path, summary_batch_size=1)
     initialize(settings)
@@ -531,9 +739,10 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
     release, saturated, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
     active, peak = 0, 0
     revision_order: list[str] = []
+    recognition_count = 0
 
     async def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal active, peak
+        nonlocal active, peak, recognition_count
         wire = json.loads(request.content)
         if wire["model"] == "revision-fixture":
             prompt = wire["messages"][1]["content"][0]["text"]
@@ -548,7 +757,14 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
                 await release.wait()
             finally:
                 active -= 1
-            result = {"ok": True} if workload == "queued_jobs" else {"text": "识别草稿", "quality": "good"}
+            if workload == "queued_jobs":
+                result = {"ok": True}
+            else:
+                recognition_count += 1
+                schema = wire["tools"][0]["function"]["parameters"]["properties"]
+                assert "quality" not in schema and "issues" not in schema
+                # Legacy model output is accepted without remediation calls or a review barrier.
+                result = {"text": "页尾没有结束的句", "quality": "uncertain", "issues": ["句子截断"]}
         return httpx.Response(
             200,
             json={
@@ -624,7 +840,9 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
         assert not any(worker.ai.limiter._models.values())
         if workload == "book_pages":
             assert revision_order == page_ids
+            assert recognition_count == count
             assert all(db.get("page", page_id)["status"] == "processed" for page_id in page_ids)
+            assert all("quality" not in db.get("page", page_id) for page_id in page_ids)
     finally:
         release.set()
         stop.set()
