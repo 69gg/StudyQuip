@@ -119,6 +119,17 @@ export const roleLabels: Record<Model["role"], string> = {
   chat: "讲解模型",
   embedding: "向量嵌入模型",
 };
+export const jobKindLabels: Record<string, string> = {
+  model_test: "模型连接测试",
+  question_extract: "整理题目",
+  question_explain: "生成讲解",
+  book_process: "整理教材",
+  page_recognize: "识别教材页",
+  book_index: "建立教材索引",
+  suggestion_regenerate: "重新生成修改建议",
+  export_pdf: "导出 PDF",
+  search: "检索教材",
+};
 export const statusLabels: Record<string, string> = {
   draft: "草稿",
   pending: "等待处理",

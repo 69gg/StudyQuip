@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { post } from "./api";
-import { type Job } from "./types";
+import { jobKindLabels, type Job } from "./types";
 import {
   Badge,
   Button,
@@ -10,17 +10,6 @@ import {
   useNotice,
   useRemote,
 } from "./ui";
-const names: Record<string, string> = {
-  model_test: "模型连接测试",
-  question_extract: "整理题目",
-  question_explain: "生成讲解",
-  book_process: "整理教材",
-  page_recognize: "识别教材页",
-  book_index: "建立教材索引",
-  suggestion_regenerate: "重新生成修改建议",
-  export_pdf: "导出 PDF",
-  search: "检索教材",
-};
 export default function Tasks() {
   const remote = useRemote<Job[]>("/jobs", []);
   const [schedule, setSchedule] = useState<{ job: Job; action: string } | null>(
@@ -51,7 +40,7 @@ export default function Tasks() {
         {remote.data.map((job) => (
           <section className="task-row" key={job.id}>
             <div className="row-between">
-              <h3>{names[job.kind] || "处理任务"}</h3>
+              <h3>{jobKindLabels[job.kind] || "处理任务"}</h3>
               <Badge status={job.status} />
             </div>
             <div className="record-meta">

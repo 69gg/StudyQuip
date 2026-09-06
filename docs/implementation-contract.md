@@ -30,6 +30,8 @@ worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrad
 
 ## Web API / frontend 契约
 
+工作台使用 hash 导航，未指定页面时进入 `#home`。首页复用科目、教材、题目、模型和任务的现有列表 API；`#questions?new=1` 与 `#books?new=1` 打开录入／导入窗口，`#questions?question=<id>` 与 `#books?book=<id>` 打开相应现有记录。深链接在资料加载后解析，目标不存在时显示提示；导航保留明确的页面选中状态。
+
 返回实体直接 JSON；列表返回数组。错误 {detail:string|object}。登录外修改请求必须 X-CSRF-Token，GET /api/session 返回 {authenticated,csrf_token,initialized}；POST /api/login {password}；POST /api/logout。首次密码由 CLI init 交互设置，不开放浏览器无认证初始化。
 
 GET/POST /api/subjects；GET/POST /api/questions；GET/PUT/DELETE /api/questions/{id}。Question fields id,revision,subject_id,type(single_choice|multiple_choice|fill_blank|short_answer),stem,options([{id,text}]),answer(any),answer_confirmed(bool),wrong_answer,notes,reference_text,asset_ids,reference_asset_ids,figure_asset_ids,book_ids,status,explanation(optional object),explanation_stale(bool)。PUT 携带 revision。POST /api/questions/{id}/confirm；POST /api/questions/{id}/extract 与 /explain body {not_before?:number,delay_seconds?:number,bypass_window?:bool} 返回 job。

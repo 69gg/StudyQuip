@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -21,13 +22,74 @@ from typing import Any
 
 import httpx
 from PIL import Image, ImageDraw
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import Browser, Page, Route, async_playwright, expect
 
 from studyquip.auth import set_password
 from studyquip.config import Settings
 from studyquip.db import Database, initialize
 from studyquip.media import prepare_book_pages, store_upload
 from studyquip.textbook import TextbookService
+
+
+async def verify_empty_workspace(browser: Browser, source: Page, base: str, directory: Path) -> None:
+    """同一测试会话的独立视图，只模拟列表为空，不修改测试库或正式资料。"""
+    context = await browser.new_context(
+        storage_state=await source.context.storage_state(),
+        viewport={"width": 1440, "height": 1000},
+        reduced_motion="reduce",
+    )
+    try:
+        page = await context.new_page()
+
+        async def empty_collection(route: Route) -> None:
+            await route.fulfill(content_type="application/json", body="[]")
+
+        await page.route(re.compile(r"/api/(subjects|books|questions|models|jobs)$"), empty_collection)
+        await page.goto(f"{base}/#home")
+        await page.get_by_role("heading", name="从第一道错题开始").wait_for()
+        appearance = page.get_by_role("radiogroup", name="外观主题")
+        system = appearance.get_by_role("radio", name="跟随系统", exact=True)
+        light = appearance.get_by_role("radio", name="浅色", exact=True)
+        dark = appearance.get_by_role("radio", name="深色", exact=True)
+        html = page.locator("html")
+        await page.emulate_media(color_scheme="light")
+        await system.check()
+        await expect(html).to_have_attribute("data-theme", "light")
+        await page.emulate_media(color_scheme="dark")
+        await expect(html).to_have_attribute("data-theme", "dark")
+        await light.check()
+        await page.emulate_media(color_scheme="light")
+        await page.emulate_media(color_scheme="dark")
+        await expect(html).to_have_attribute("data-theme", "light")
+        await page.reload()
+        await page.get_by_role("heading", name="从第一道错题开始").wait_for()
+        await expect(light).to_be_checked()
+        await expect(html).to_have_attribute("data-theme", "light")
+        assert await page.evaluate("localStorage.getItem('studyquip-theme')") == "light"
+        await page.screenshot(path=str(directory / "home-empty-desktop.png"), full_page=True)
+        await light.press("ArrowRight")
+        await expect(dark).to_be_checked()
+        await expect(light).not_to_be_checked()
+        await expect(system).not_to_be_checked()
+        await expect(html).to_have_attribute("data-theme", "dark")
+        await page.screenshot(path=str(directory / "home-empty-desktop-dark.png"), full_page=True)
+        await page.set_viewport_size({"width": 320, "height": 844})
+        assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "窄屏首页溢出"
+        await page.screenshot(path=str(directory / "home-empty-mobile-dark.png"), full_page=True)
+        await (
+            page.get_by_role("navigation", name="主导航").get_by_role("link", name="错题", exact=True).click()
+        )
+        await page.locator(".library-notice").wait_for()
+        for theme, name in (("dark", "深色"), ("light", "浅色")):
+            await appearance.get_by_role("radio", name=name, exact=True).check()
+            await expect(html).to_have_attribute("data-theme", theme)
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "资料提示条溢出"
+            await page.screenshot(path=str(directory / f"notice-mobile-{theme}.png"), full_page=True)
+        await page.locator(".library-notice").get_by_role("link", name="导入教材").click()
+        await expect(page.get_by_role("dialog")).to_be_visible()
+        await expect(page.get_by_role("textbox", name="教材名称", exact=True)).to_have_value("")
+    finally:
+        await context.close()
 
 
 async def verify(output: Path) -> dict[str, Any]:
@@ -202,6 +264,41 @@ async def verify(output: Path) -> dict[str, Any]:
                         await page.goto(base)
                         await page.locator('input[type="password"]').fill(password)
                         await page.locator('button[type="submit"]').click()
+                        await page.get_by_role("heading", name="首页", exact=True).wait_for()
+                        await page.get_by_role("heading", name="最近错题", exact=True).wait_for()
+                        await page.screenshot(path=str(directory / "home-desktop.png"), full_page=True)
+                        await page.locator(f'a[href="#questions?question={questions[0]["id"]}"]').click()
+                        await page.get_by_role("dialog").wait_for()
+                        await expect(page.get_by_role("textbox", name="题干", exact=True)).to_have_value(
+                            questions[0]["stem"]
+                        )
+                        await page.get_by_role("button", name="关闭窗口", exact=True).click()
+                        navigation = page.get_by_role("navigation", name="主导航")
+                        await navigation.get_by_role("link", name="首页", exact=True).click()
+                        await page.get_by_role("link", name="导入教材", exact=True).click()
+                        await page.get_by_role("dialog").wait_for()
+                        await expect(page.get_by_role("textbox", name="教材名称", exact=True)).to_have_value(
+                            ""
+                        )
+                        await page.get_by_role("button", name="关闭窗口", exact=True).click()
+                        await navigation.get_by_role("link", name="首页", exact=True).click()
+                        await page.locator(f'a[href="#books?book={book["id"]}"]').click()
+                        await page.get_by_role("heading", name=book["title"], exact=True).wait_for()
+                        await navigation.get_by_role("link", name="首页", exact=True).click()
+                        await page.set_viewport_size({"width": 390, "height": 844})
+                        await page.get_by_role("heading", name="最近错题", exact=True).wait_for()
+                        assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                        await page.screenshot(path=str(directory / "home-mobile.png"), full_page=True)
+                        await page.get_by_role("link", name="录入错题", exact=True).click()
+                        await page.get_by_role("dialog").wait_for()
+                        await expect(page.get_by_role("textbox", name="题干", exact=True)).to_have_value("")
+                        await page.get_by_role("button", name="关闭窗口", exact=True).click()
+                        report["home_shortcuts_and_recent_links"] = True
+                        await verify_empty_workspace(browser, page, base, directory)
+                        report["empty_home_and_notice"] = "桌面、320px 窄屏、浅色与深色；空列表为浏览器夹具"
+                        report["theme_switch"] = "单选、键盘方向切换、刷新持久化、系统跟随及固定外观隔离通过"
+                        await page.set_viewport_size({"width": 1440, "height": 1000})
+                        await navigation.get_by_role("link", name="错题", exact=True).click()
                         await page.get_by_role("heading", name="错题", exact=True).wait_for()
                         await page.screenshot(path=str(directory / "desktop.png"), full_page=True)
                         await page.set_viewport_size({"width": 390, "height": 844})
@@ -209,10 +306,14 @@ async def verify(output: Path) -> dict[str, Any]:
                             "移动页面横向溢出"
                         )
                         await page.screenshot(path=str(directory / "mobile.png"), full_page=True)
-                        await page.get_by_label("外观主题").select_option("dark")
+                        await (
+                            page.get_by_role("radiogroup", name="外观主题")
+                            .get_by_role("radio", name="深色", exact=True)
+                            .check()
+                        )
                         await page.wait_for_timeout(250)
                         await page.screenshot(path=str(directory / "mobile-dark.png"), full_page=True)
-                        await page.get_by_role("button", name="＋ 录入错题").click()
+                        await page.get_by_role("button", name="录入错题", exact=True).click()
                         await page.get_by_role("dialog").wait_for()
                         await page.wait_for_timeout(250)
                         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (
@@ -228,8 +329,9 @@ async def verify(output: Path) -> dict[str, Any]:
                         original_reason = "我当时漏看了条件，把初速度当成了零。"
                         await reason.fill(original_reason)
                         async with page.expect_response(
-                            lambda response: response.url == f"{base}/api/questions"
-                            and response.request.method == "POST"
+                            lambda response: (
+                                response.url == f"{base}/api/questions" and response.request.method == "POST"
+                            )
                         ) as saved_response:
                             await page.get_by_role("button", name="保存", exact=True).click()
                         saved = await (await saved_response.value).json()

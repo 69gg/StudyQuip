@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowUpRight, BookOpen, Plus } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { api, post, put, remove } from "./api";
 import {
@@ -51,17 +52,38 @@ export function emptyQuestion(subjectId: string): Question {
 export default function Questions({
   subjects,
   books,
+  startNew = false,
+  initialQuestionId = null,
 }: {
   subjects: Subject[];
   books: Book[];
+  startNew?: boolean;
+  initialQuestionId?: string | null;
 }) {
   const remote = useRemote<Question[]>("/questions", []);
   const [search, setSearch] = useState(""),
     [subject, setSubject] = useState(""),
     [type, setType] = useState(""),
-    [editor, setEditor] = useState<Question | null>(null),
+    [editor, setEditor] = useState<Question | null>(() =>
+      startNew ? emptyQuestion(subjects[0]?.id || "") : null,
+    ),
     [selected, setSelected] = useState<string[]>([]),
     [exporting, setExporting] = useState(false);
+  const openedInitial = useRef(false);
+  const notice = useNotice();
+  useEffect(() => {
+    if (
+      !initialQuestionId ||
+      openedInitial.current ||
+      remote.loading ||
+      remote.error
+    )
+      return;
+    openedInitial.current = true;
+    const question = remote.data.find((item) => item.id === initialQuestionId);
+    if (question) setEditor(question);
+    else notice("这道错题已不存在，请在列表中选择其他题目。", true);
+  }, [initialQuestionId, remote.data, remote.loading, remote.error, notice]);
   const questions = remote.data.filter(
     (q) =>
       (!subject || q.subject_id === subject) &&
@@ -90,13 +112,19 @@ export default function Questions({
             kind="primary"
             onClick={() => setEditor(emptyQuestion(subjects[0]?.id || ""))}
           >
-            ＋ 录入错题
+            <Plus size={16} aria-hidden="true" />
+            录入错题
           </Button>
         </div>
       </div>
       {books.length === 0 && (
-        <div className="gentle-notice">
-          还没有教材。可以先在教材库导入资料，让讲解有据可依。
+        <div className="gentle-notice library-notice">
+          <BookOpen size={18} strokeWidth={1.7} aria-hidden="true" />
+          <p>还没有教材。可以先在教材库导入资料，让讲解有据可依。</p>
+          <a href="#books?new=1">
+            导入教材
+            <ArrowUpRight size={14} aria-hidden="true" />
+          </a>
         </div>
       )}
       <div className="filter-bar">
@@ -191,9 +219,12 @@ export default function Questions({
                 />
                 {q.notes && <p className="record-note">{q.notes}</p>}
               </button>
-              <span className="row-arrow" aria-hidden>
-                ↗
-              </span>
+              <ArrowUpRight
+                className="row-arrow"
+                size={18}
+                strokeWidth={1.7}
+                aria-hidden="true"
+              />
             </div>
           ))}
         </div>

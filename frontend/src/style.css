@@ -29,6 +29,9 @@
   --accent-bg: #e4eee5;
   --hover: #ecf0e9;
   --danger: #a34638;
+  --notice-bg: #fbf1df;
+  --notice-text: #765c28;
+  --notice-line: #c6a05a;
   --shadow: 0 20px 90px #1d30202b;
   font-size: 14px;
   line-height: 1.65;
@@ -46,6 +49,9 @@
   --accent-bg: #283f33;
   --hover: #2a342e;
   --danger: #eea496;
+  --notice-bg: #332e23;
+  --notice-text: #dfc691;
+  --notice-line: #a78b4d;
   --shadow: 0 20px 90px #0007;
 }
 * {
@@ -189,18 +195,10 @@ small,
   margin: 0 0 45px;
 }
 .brand-symbol {
-  background: var(--accent);
-  color: var(--bg);
-  height: 29px;
-  width: 29px;
-  border-radius: 7px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-family: serif;
-  font-size: 26px;
-  font-weight: 700;
-  line-height: 1;
+  display: block;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
 }
 .sidebar nav {
   display: flex;
@@ -211,6 +209,7 @@ small,
   text-decoration: none;
   display: flex;
   align-items: center;
+  gap: 11px;
   padding: 11px 17px;
   min-height: 45px;
   border-radius: 6px;
@@ -247,19 +246,6 @@ small,
   gap: 15px;
   font-size: 12px;
   padding-top: 24px;
-}
-.theme-select {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-}
-.theme-select select {
-  font-size: 12px;
-  padding: 5px;
-  min-height: 35px;
-  flex: 1;
-  background: transparent;
 }
 .sidebar-bottom .button {
   align-self: flex-start;
@@ -514,12 +500,35 @@ small,
   gap: 10px;
 }
 .gentle-notice {
-  border-left: 2px solid var(--accent);
-  background: var(--accent-bg);
+  border-left: 2px solid var(--notice-line);
+  background: var(--notice-bg);
   padding: 12px 16px;
-  color: var(--accent);
+  color: var(--notice-text);
   font-size: 12px;
   margin-bottom: 22px;
+}
+.library-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.library-notice > svg {
+  flex-shrink: 0;
+}
+.library-notice p {
+  flex: 1;
+}
+.library-notice a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.library-notice a:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
 }
 .inline-error {
   padding: 12px 14px;
@@ -1335,6 +1344,10 @@ details > .stack {
   font-weight: 700;
   letter-spacing: -0.6px;
 }
+.login-brand .brand-symbol {
+  width: 42px;
+  height: 42px;
+}
 .login-shell form {
   width: 390px;
   max-width: 100%;
@@ -1518,9 +1531,8 @@ details > .stack {
     gap: 8px;
   }
   .brand-symbol {
-    width: 27px;
-    height: 27px;
-    font-size: 24px;
+    width: 30px;
+    height: 30px;
   }
   .sidebar nav {
     grid-column: 1/-1;
@@ -1533,9 +1545,11 @@ details > .stack {
   .sidebar nav a {
     flex: 1;
     justify-content: center;
-    padding: 10px 5px;
-    font-size: 13px;
-    min-height: 43px;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 3px;
+    font-size: 12px;
+    min-height: 57px;
     border-radius: 4px 4px 0 0;
   }
   .sidebar nav a.current:before {
@@ -1545,29 +1559,39 @@ details > .stack {
     top: auto;
     bottom: 0;
   }
+  .library-notice {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+  }
+  .library-notice > svg {
+    margin-top: 1px;
+  }
+  .library-notice p {
+    flex-basis: calc(100% - 28px);
+  }
+  .library-notice a {
+    margin-left: 28px;
+  }
   .sidebar-bottom {
     margin: 0;
     padding: 0;
     flex-direction: row;
     align-items: center;
-    gap: 8px;
-  }
-  .theme-select > span {
-    display: none;
-  }
-  .theme-select select {
-    font-size: 11px;
-    min-height: 32px;
-    width: 84px;
-    padding: 3px;
-    background: transparent;
-    border: 0;
+    gap: 6px;
   }
   .sidebar-bottom .button {
     align-self: auto;
     font-size: 11px;
     min-height: 32px;
     padding: 3px;
+  }
+  .sidebar-bottom .logout-button {
+    width: 32px;
+    min-width: 32px;
+  }
+  .logout-button > span {
+    display: none;
   }
   .workspace {
     margin: 0;

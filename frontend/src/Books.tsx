@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowUpRight, Plus } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { api, post, put, remove } from "./api";
 import { assetUrl, type Book, type Entity, type Subject } from "./types";
@@ -71,15 +72,44 @@ export function orderNodes(nodes: Node[]): { node: Node; depth: number }[] {
 export default function Books({
   subjects,
   onChanged,
+  startNew = false,
+  initialBookId = null,
 }: {
   subjects: Subject[];
   onChanged: () => void;
+  startNew?: boolean;
+  initialBookId?: string | null;
 }) {
   const remote = useRemote<Book[]>("/books", []);
+  const newBook = (): Book => ({
+    id: "",
+    revision: 0,
+    title: "",
+    subject_id: subjects[0]?.id || "",
+    text: "",
+    asset_ids: [],
+  });
   const [selected, setSelected] = useState<Book | null>(null),
-    [editing, setEditing] = useState<Book | null>(null),
+    [editing, setEditing] = useState<Book | null>(() =>
+      startNew ? newBook() : null,
+    ),
     [subject, setSubject] = useState(""),
     [search, setSearch] = useState("");
+  const openedInitial = useRef(false);
+  const notice = useNotice();
+  useEffect(() => {
+    if (
+      !initialBookId ||
+      openedInitial.current ||
+      remote.loading ||
+      remote.error
+    )
+      return;
+    openedInitial.current = true;
+    const book = remote.data.find((item) => item.id === initialBookId);
+    if (book) setSelected(book);
+    else notice("这本教材已不存在，请在列表中选择其他教材。", true);
+  }, [initialBookId, remote.data, remote.loading, remote.error, notice]);
   function reload() {
     remote.reload();
     onChanged();
@@ -107,20 +137,9 @@ export default function Books({
         </div>
         <div className="inline-actions">
           <Button onClick={reload}>刷新</Button>
-          <Button
-            kind="primary"
-            onClick={() =>
-              setEditing({
-                id: "",
-                revision: 0,
-                title: "",
-                subject_id: subjects[0]?.id || "",
-                text: "",
-                asset_ids: [],
-              })
-            }
-          >
-            ＋ 导入教材
+          <Button kind="primary" onClick={() => setEditing(newBook())}>
+            <Plus size={16} aria-hidden="true" />
+            导入教材
           </Button>
         </div>
       </div>
@@ -170,7 +189,12 @@ export default function Books({
                 <Badge status={book.status || "draft"} />
               </div>
             </div>
-            <span className="row-arrow">↗</span>
+            <ArrowUpRight
+              className="row-arrow"
+              size={18}
+              strokeWidth={1.7}
+              aria-hidden="true"
+            />
           </button>
         ))}
       </div>

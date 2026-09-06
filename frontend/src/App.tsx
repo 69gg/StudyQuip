@@ -1,7 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import {
+  BookOpen,
+  House,
+  ListTodo,
+  LogOut,
+  NotebookPen,
+  Search as SearchIcon,
+  Settings2,
+} from "lucide-react";
 import { api, post, setCsrf } from "./api";
+import BrandMark from "./BrandMark";
+import ThemeSwitch, { type Theme } from "./ThemeSwitch";
 import type { Book, Subject } from "./types";
-import { Button, Field, NoticeContext, useRemote } from "./ui";
+import { Button, Field, NoticeContext, State, useRemote } from "./ui";
+const Home = lazy(() => import("./Home"));
 const Questions = lazy(() => import("./Questions"));
 const Books = lazy(() => import("./Books"));
 const Models = lazy(() => import("./Models"));
@@ -13,13 +25,13 @@ type Session = {
   csrf_token?: string;
   initialized: boolean;
 };
-type Theme = "light" | "dark" | "system";
 const tabs = [
-  ["questions", "错题"],
-  ["books", "教材"],
-  ["search", "检索"],
-  ["tasks", "任务"],
-  ["settings", "设置"],
+  { id: "home", label: "首页", icon: House },
+  { id: "questions", label: "错题", icon: NotebookPen },
+  { id: "books", label: "教材", icon: BookOpen },
+  { id: "search", label: "检索", icon: SearchIcon },
+  { id: "tasks", label: "任务", icon: ListTodo },
+  { id: "settings", label: "设置", icon: Settings2 },
 ];
 export default function App() {
   const print = location.pathname.match(/^\/print\/([^/]+)$/);
@@ -32,7 +44,7 @@ export default function App() {
 function Workspace() {
   const [session, setSession] = useState<Session | null>(null),
     [error, setError] = useState(""),
-    [tab, setTab] = useState(location.hash.slice(1) || "questions"),
+    [tab, setTab] = useState(location.hash.slice(1) || "home"),
     [theme, setTheme] = useState<Theme>(() => {
       const saved = localStorage.getItem("studyquip-theme");
       return saved === "light" || saved === "dark" ? saved : "system";
@@ -65,11 +77,16 @@ function Workspace() {
   }, []);
   useEffect(() => {
     function hash() {
-      setTab(location.hash.slice(1) || "questions");
+      setTab(location.hash.slice(1) || "home");
     }
     window.addEventListener("hashchange", hash);
     return () => window.removeEventListener("hashchange", hash);
   }, []);
+  useEffect(() => {
+    const label =
+      tabs.find((item) => item.id === tab.split("?")[0])?.label || "首页";
+    document.title = `${label} · StudyQuip`;
+  }, [tab]);
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     function apply() {
@@ -95,38 +112,29 @@ function Workspace() {
       ) : (
         <div className="app-shell">
           <aside className="sidebar">
-            <a className="brand" href="#questions">
-              <span className="brand-symbol" aria-hidden>
-                ∴
-              </span>
+            <a className="brand" href="#home" aria-label="StudyQuip 首页">
+              <BrandMark className="brand-symbol" />
               StudyQuip
             </a>
             <nav aria-label="主导航">
-              {tabs.map(([id, label]) => (
+              {tabs.map(({ id, label, icon: Icon }) => (
                 <a
                   key={id}
                   href={`#${id}`}
-                  className={tab === id ? "current" : ""}
-                  aria-current={tab === id ? "page" : undefined}
+                  className={tab.split("?")[0] === id ? "current" : ""}
+                  aria-current={tab.split("?")[0] === id ? "page" : undefined}
                 >
-                  {label}
+                  <Icon size={18} strokeWidth={1.7} aria-hidden="true" />
+                  <span>{label}</span>
                 </a>
               ))}
             </nav>
             <div className="sidebar-bottom">
-              <label className="theme-select">
-                <span>外观</span>
-                <select
-                  aria-label="外观主题"
-                  value={theme}
-                  onChange={(e) => setTheme(e.target.value as Theme)}
-                >
-                  <option value="system">跟随系统</option>
-                  <option value="light">浅色</option>
-                  <option value="dark">深色</option>
-                </select>
-              </label>
+              <ThemeSwitch value={theme} onChange={setTheme} />
               <Button
+                className="logout-button"
+                aria-label="退出登录"
+                title="退出登录"
                 onClick={async () => {
                   try {
                     await post("/logout");
@@ -137,13 +145,14 @@ function Workspace() {
                   }
                 }}
               >
-                退出登录
+                <LogOut size={16} strokeWidth={1.7} aria-hidden="true" />
+                <span>退出登录</span>
               </Button>
             </div>
           </aside>
           <main className="workspace">
             <Suspense fallback={<div className="loading">正在载入…</div>}>
-              <WorkspaceContent tab={tab} />
+              <WorkspaceContent key={tab} tab={tab} />
             </Suspense>
           </main>
         </div>
@@ -165,6 +174,17 @@ function Workspace() {
 function WorkspaceContent({ tab }: { tab: string }) {
   const subjects = useRemote<Subject[]>("/subjects", []),
     books = useRemote<Book[]>("/books", []);
+  const [ready, setReady] = useState(false);
+  const [page, query = ""] = tab.split("?", 2);
+  const params = new URLSearchParams(query);
+  const refreshLibrary = useCallback(() => {
+    subjects.reload();
+    books.reload();
+  }, [subjects.reload, books.reload]);
+  useEffect(() => {
+    if (!subjects.loading && !books.loading && !subjects.error && !books.error)
+      setReady(true);
+  }, [subjects.loading, books.loading, subjects.error, books.error]);
   if (subjects.error || books.error)
     return (
       <div className="inline-error">
@@ -179,16 +199,39 @@ function WorkspaceContent({ tab }: { tab: string }) {
         </Button>
       </div>
     );
-  if (tab === "books")
-    return <Books subjects={subjects.data} onChanged={books.reload} />;
-  if (tab === "settings")
+  if (!ready) return <State loading />;
+  if (page === "books")
+    return (
+      <Books
+        subjects={subjects.data}
+        onChanged={books.reload}
+        startNew={params.get("new") === "1"}
+        initialBookId={params.get("book")}
+      />
+    );
+  if (page === "settings")
     return (
       <Models subjects={subjects.data} onSubjectsChanged={subjects.reload} />
     );
-  if (tab === "tasks") return <Tasks />;
-  if (tab === "search")
+  if (page === "tasks") return <Tasks />;
+  if (page === "search")
     return <Search subjects={subjects.data} books={books.data} />;
-  return <Questions subjects={subjects.data} books={books.data} />;
+  if (page === "questions")
+    return (
+      <Questions
+        subjects={subjects.data}
+        books={books.data}
+        startNew={params.get("new") === "1"}
+        initialQuestionId={params.get("question")}
+      />
+    );
+  return (
+    <Home
+      subjects={subjects.data}
+      books={books.data}
+      onRefresh={refreshLibrary}
+    />
+  );
 }
 function Login({
   session,
@@ -205,7 +248,8 @@ function Login({
   return (
     <main className="login-shell">
       <div className="login-brand">
-        <span className="brand-symbol">∴</span>StudyQuip
+        <BrandMark className="brand-symbol" size={42} />
+        StudyQuip
       </div>
       <form
         onSubmit={async (e) => {
