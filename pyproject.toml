@@ -1,0 +1,56 @@
+[project]
+name = "studyquip"
+version = "0.1.0"
+description = "个人错题与教材学习工作台"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{name = "Null", email = "pylindex@qq.com"}]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "pydantic-settings>=2.7",
+  "sqlalchemy>=2.0",
+  "alembic>=1.14",
+  "portalocker[win32]==4.3.0",
+  "sqlite-vec>=0.1.6",
+  "jieba>=0.42.1",
+  "openai>=2.0",
+  "httpx>=0.28",
+  "python-multipart>=0.0.20",
+  "pillow>=11",
+  "pillow-heif>=0.21",
+  "pypdfium2>=4.30",
+  "playwright>=1.51",
+  "argon2-cffi>=23.1",
+  "typer>=0.15",
+  "tzdata>=2025.1",
+]
+
+[project.scripts]
+studyquip = "studyquip.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.11"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/studyquip"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.uv]
+required-version = "==0.12.10"
+python-downloads-json-url = "https://raw.githubusercontent.com/astral-sh/uv/0.12.10/crates/uv-python/download-metadata.json"

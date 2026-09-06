@@ -1,0 +1,37 @@
+# StudyQuip Web UI
+
+基于 React、TypeScript 和 Vite 的单用户工作台。作者 Null，邮箱 pylindex@qq.com，采用 MIT 许可。
+
+## 本地开发
+
+在项目根目录按主 README 初始化并启动后端和 worker，然后执行：
+
+```sh
+cd frontend
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+开发服务器默认绑定 `127.0.0.1:5173`。`/api` 由 Vite 同源代理到 `http://127.0.0.1:8765`，可用 `VITE_API_TARGET` 修改目标。后端的 `STUDYQUIP_ALLOWED_ORIGINS` 需要包含实际访问的开发地址。局域网开发时显式执行 `pnpm dev --host 0.0.0.0`，并配置对应 Origin；生产使用后端直接提供 `dist`。
+
+```sh
+pnpm format:check
+pnpm test
+pnpm build
+```
+
+安装构建脚本仅显式允许 esbuild；依赖版本由 pnpm-lock.yaml 固定。
+
+## 实现边界
+
+- 所有业务数据来自 `/api`，前端没有演示数据。修改请求带会话 CSRF token；模型测试、识别、讲解、语义检索和导出均提交持久任务。
+- 页面按需加载；普通界面使用设备系统字体，PDF 使用随应用分发的 Noto 中文字体。外观支持浅色、深色和跟随系统。
+- 相册/文件与拍照为独立入口。拍照使用 `input capture="environment"`，由移动系统相机处理；桌面或不支持 capture 的浏览器显示文件选择器。无需网页摄像头权限或 getUserMedia。
+- 图片裁剪根据经过 EXIF 归正的预览图自然尺寸提交坐标；PDF 原件与文本文件没有裁剪按钮。UUID 使用标准库，并兼容局域网 HTTP 上没有 `crypto.randomUUID` 的浏览器。
+- 教材目录使用任意深度父子树；段落修改使用 revision 和操作组 ID，网络失败后相同内容重试沿用组 ID。历史恢复创建新修订，涉及合并或拆分的历史不可强制单段恢复。
+- 题目预览与 PDF 共用 Markdown/KaTeX 渲染，不执行原始 HTML，不加载 Markdown 远程图片。题目原图、参考答案图和备注不直接混入打印正文。
+- “做错原因”由用户填写，可留空，与原错误作答和备注分别保存。“让 AI 优化表述”默认不勾选；勾选且原文非空时，在生成讲解的同一次模型调用中优化表达，原文始终保留。优化结果单独标注，取消勾选、清空原文或修改题目使讲解过期后立即隐藏，重新生成后显示新结果。错题搜索包含原文。
+- `/print/:id?token=…` 仅加载授权导出快照。只有中文普通/粗体字体、公式和全部配图通过校验，才设置 `window.__STUDYQUIP_PRINT_READY__`；失败设置 `window.__STUDYQUIP_PRINT_ERROR__`。练习模式在渲染边界再次关闭答案、解析和知识点。
+- PDF 将题号、题干、必要配图、选项和作答留白作为分页单元；短题尽量保持完整，解析仍可在段落间自然跨页。
+
+单元测试覆盖答案选项映射、做错原因的默认选择与优化结果显示边界、导出内容隔离、练习模式保护及数学/化学公式。根目录的本地验收脚本覆盖真实 Web/worker、登录、PDF 与移动视口；不依赖真实上游模型来伪造 AI 验收结果。
