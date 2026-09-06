@@ -423,7 +423,7 @@ function ModelEditor({
               {numberField(
                 "context_tokens",
                 "上下文预算（tokens）",
-                "留空使用应用统一预算；此项不会发送给模型。",
+                "留空不设应用侧请求上限，教材仍分块处理；此项不会发送给模型。",
                 true,
                 1024,
               )}

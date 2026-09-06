@@ -181,10 +181,12 @@ export function Modal({
 }
 export function ScheduleDialog({
   title,
+  description,
   onClose,
   onSubmit,
 }: {
   title: string;
+  description?: string;
   onClose: () => void;
   onSubmit: (schedule: Schedule) => Promise<unknown>;
 }) {
@@ -223,6 +225,7 @@ export function ScheduleDialog({
   return (
     <Modal title={title} onClose={onClose}>
       <div className="stack">
+        {description && <p className="hint">{description}</p>}
         <Field label="提交时间">
           <select value={mode} onChange={(e) => setMode(e.target.value)}>
             <option value="now">现在加入队列</option>

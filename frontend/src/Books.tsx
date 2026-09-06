@@ -17,6 +17,7 @@ import { MathText } from "./Content";
 import Uploads from "./Uploads";
 import {
   ResourceProgress,
+  ResumeJobButton,
   useResourceJobs,
   useJobs,
   matchingJobs,
@@ -368,6 +369,13 @@ function BookDetail({
     null,
   );
   const tasks = useResourceJobs(book.id, undefined, true);
+  const latestBookTask = tasks.jobs.find((job) =>
+    ["book_process", "book_index"].includes(job.kind),
+  );
+  const resumableTask =
+    latestBookTask?.resume?.available && tasks.ready && !tasks.error
+      ? latestBookTask
+      : null;
   useJobCompletion(tasks.jobs, refresh);
   function refresh() {
     nodes.reload();
@@ -416,17 +424,21 @@ function BookDetail({
         <div className="inline-actions">
           <Button onClick={refresh}>刷新结果</Button>
           <Button onClick={() => setEditing(true)}>教材设置</Button>
-          <Button
-            kind="primary"
-            disabled={tasks.blocked}
-            onClick={() => setSchedule(`/books/${book.id}/process`)}
-          >
-            {tasks.active.length
-              ? "已有处理任务"
-              : !tasks.ready
-                ? "读取任务状态…"
-                : "识别与整理"}
-          </Button>
+          {resumableTask ? (
+            <ResumeJobButton job={resumableTask} />
+          ) : (
+            <Button
+              kind="primary"
+              disabled={tasks.blocked}
+              onClick={() => setSchedule(`/books/${book.id}/process`)}
+            >
+              {tasks.active.length
+                ? "已有处理任务"
+                : !tasks.ready
+                  ? "读取任务状态…"
+                  : "识别与整理"}
+            </Button>
+          )}
         </div>
       </div>
       <ResourceProgress resourceId={book.id} includeChildren />

@@ -72,7 +72,14 @@ class ContextBuilder:
             units.append(current)
         return units
 
-    def build(self, book_id: str, page_id: str, tools: Any = None, unit_index: int = 0) -> dict[str, Any]:
+    def build(
+        self,
+        book_id: str,
+        page_id: str,
+        tools: Any = None,
+        unit_index: int = 0,
+        unit_budget: int | None = None,
+    ) -> dict[str, Any]:
         with self.db.read() as conn:
             book = self.db.get("book", book_id, conn=conn)
             page = self.db.get("page", page_id, conn=conn)
@@ -137,7 +144,8 @@ class ContextBuilder:
             reserved = estimate_tokens(tools or [])
             if reserved > self.token_budget // 2:
                 raise ValueError("工具定义超过上下文预算，请减少当前轮次工具")
-            unit_budget = min(self.token_budget // 4, max(128, (self.token_budget - reserved) // 3))
+            if unit_budget is None:
+                unit_budget = min(self.token_budget // 4, max(128, (self.token_budget - reserved) // 3))
             units = self.units(page.get("text", ""), unit_budget)
             if not (0 <= unit_index < len(units)):
                 raise ValueError("页面处理单元越界")
@@ -158,6 +166,7 @@ class ContextBuilder:
                     "text": units[unit_index],
                     "unit_index": unit_index,
                     "unit_count": len(units),
+                    "unit_budget": unit_budget,
                     "gap_before": position > 0 and pages[position - 1].get("status") == "skipped",
                 },
                 "previous_blocks": blocks,

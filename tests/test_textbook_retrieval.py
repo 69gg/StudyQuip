@@ -301,6 +301,17 @@ def test_longbook_budget_lossless_units_and_gap(
     units = builder.units(long, budget=512)
     assert "".join(units) == long
     assert all(estimate_tokens(unit) <= 512 for unit in units)
+    page = db.get("page", "p299")
+    assert page
+    db.put("page", {**page, "text": "分块边界😀" * 300}, id=page["id"])
+    initial = builder.build(book["id"], page["id"])["current_page"]
+    expanded = ContextBuilder(db, token_budget=8192)
+    for index in range(initial["unit_count"]):
+        original = builder.build(book["id"], page["id"], unit_index=index)["current_page"]
+        resumed = expanded.build(
+            book["id"], page["id"], tools=["新工具定义"], unit_index=index, unit_budget=initial["unit_budget"]
+        )["current_page"]
+        assert resumed["text"] == original["text"] and resumed["unit_count"] == initial["unit_count"]
 
 
 def test_restore_topology_as_group_creates_new_versions(

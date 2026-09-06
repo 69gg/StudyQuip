@@ -57,6 +57,11 @@ export type Job = Entity & {
   payload?: Record<string, unknown>;
   blocking?: boolean;
   recovering?: boolean;
+  resume?: {
+    available: boolean;
+    has_saved_progress: boolean;
+    reason?: string | null;
+  };
   reused?: boolean;
   resource_title?: string;
   book_id?: string;

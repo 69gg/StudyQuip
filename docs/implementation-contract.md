@@ -16,6 +16,10 @@
 
 `enqueue`、`get`、`list` 和 `cancel` 可接受已有事务 `conn`，业务变更与任务创建／取消可以原子提交。`wait_for_review` 保存人工等待状态；`wake_book(book_id, conn=None)` 优先复用同书已有活动任务或最早等待任务；`resume_waiting(kind,resource_id,conn=None)` 在增加预算后恢复等待任务并保留检查点。依赖任务失败或取消时，依赖方明确失败；大量等待依赖的任务不能遮挡后续可执行任务。
 
+`resume(id,not_before,bypass_window=False)` 复用原任务和检查点，接受失败／取消／待人工处理状态；对于已在队列、运行或等待时段的同一任务幂等返回，不改变预约和租约。`POST /api/jobs/{id}/resume` 与兼容 `/retry` 接收可选 `ScheduleInput`，修复旧重试接口忽略预约请求体的行为。`resume_problem` 与执行层共用来源指纹，恢复前拒绝互斥任务、已删除来源及输入修改，已完成任务不能恢复。无需数据库迁移。
+
+模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。配置变化重建未完成工具链时一起清除此输入快照。兼容旧检查点：缺少该字段时只补建初始输入，已有 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 固定该草稿版本的材料预算与实际单元预算，防止恢复时配置变化让已完成单元索引对应到不同文本。
+
 worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrade/password/web/worker/run。
 
 worker 持有在途协程的强引用，完成回调释放引用，退出时取消并等待剩余任务。不限制在途任务数量；`book_process` 通过 `asyncio.gather` 并行识别草稿并按原输入顺序收集结果，不再设置单书页数信号量。所有模型请求仍经 `CapacityLimiter` 原子检查模型和凭据上限，正式跨页修订仍顺序执行。`max_active_jobs` 已从 `Settings` 移除。
@@ -55,7 +59,7 @@ Model 另有 `tool_choice:required|auto|omit`，默认 `required`；`omit` 完�
 
 Model 的 `max_output_tokens:int|null` 默认 `null`；前端新增配置默认为空，清空后提交 `null`。服务端拒绝 0／负数，缺省或 `null` 时完全省略请求中的 `max_completion_tokens`、`max_tokens` 和 `max_output_tokens`，不会发送值为 `null` 的字段；正整数按协议及 `max_tokens_field` 映射。已保存的显式上限保留，旧记录缺少此字段时按 `null` 处理，无需架构迁移。教材上下文未配置输出上限时仅以 `Settings.output_tokens` 预留内部预算，不将该预留值作为模型请求参数。
 
-Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时留空，清空后提交 `null`，填写时最小为 1024。该字段仅用于应用内部输入预算，不映射到 Chat Completions、Responses 或 Embeddings 请求，也禁止通过 `extra_body` 发送。统一使用 `ModelProfile.effective_context_tokens(application_budget:int)->int`：缺省／`null` 返回应用预算，显式整数返回它与应用预算的较小值。调用方使用 `Settings.context_tokens`（默认 24000）作为应用预算；工具请求、教材修订、概述分段／合批及嵌入分批均复用这一规则。已有显式值保留，旧记录缺少字段时按 `null` 处理，无需架构迁移；清空不取消教材长上下文保护。
+Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时留空，清空后提交 `null`，填写时最小为 1024。该字段不映射到 Chat Completions、Responses 或 Embeddings 请求，也禁止通过 `extra_body` 发送。完整结构化请求只检查用户显式设置的 `context_tokens`；为空则省略应用侧请求长度检查，超限错误包含保守估算及显式上限。材料分块仍通过 `ModelProfile.effective_context_tokens(application_budget:int)->int`：缺省／`null` 返回应用预算，显式整数返回它与应用预算的较小值。`Settings.context_tokens`（默认 24000）只控制教材修订的初始材料、概述分段／合批及嵌入分批，不是工具续接的隐含上限。已有显式值保留，无需架构迁移；检查点里的思考及工具项不会因此被截断或删除。
 
 无需嵌入请求的检索同步返回结果数组；配置了嵌入模型的 semantic/hybrid 查询返回 HTTP 202 `{job: ...}`，由 worker 获取查询向量。前端从任务结果 `result.hits` 读取命中，不绕过 worker 直接调用服务商。校对操作组必须提供应用生成的 `operation_group_id`（也接受 `group_id`）；没有 ID 明确报错。
 
@@ -64,5 +68,7 @@ GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/export
 所有返回任务的 Web API 统一使用投影：保留 `id/kind/resource_id/status/created_at/updated_at/not_before/attempts/error/result/bypass_window/reused`，增加 `resource_title/book_id/question_ids/blocking/recovering/waiting_reason/progress`；仅搜索任务提供恢复表单所需的 `input`。不再返回内部 `checkpoint/payload/owner/lease_token`。`GET /api/jobs` 包含最近 100 条及更早的全部活动任务。
 
 `progress` 包含可选的 `phase/current_page/total_pages/recognized_pages/processed_pages/review_pages/skipped_pages/pending_pages/blocks/nodes/summarized_nodes/embedding_total/embedding_completed`，以及 `completed_units/completed_stages/usage/active_requests/embedding_activity/last_activity_at`。请求活动字段为 `state/at/attempt/model/revision/role/page`（按来源可缺省）。页数来自当前正式数据；原页内部顺序不进入对外教材引用。用量为已保存响应累计，原始检查点仅供 worker 使用。
+
+同一投影的 `resume:{available,has_saved_progress,reason}` 驱动续接入口和不可续接提示；`request_context` 与完整工具转录不得进入此响应。前端共用 `ResumeJobButton` 与原预约弹窗，提交后利用已有任务事件同步状态。
 
 前端 `JobsProvider` 在工作台路由外共享状态，写操作通过 `studyquip:jobs-changed` 通知立即合并任务并刷新；轮询间隔集中为 3000 ms。处理按钮在加载／错误／已有活动任务时禁用；任务结束通知对应页面刷新已提交结果，原页编辑保留未保存文本与基础版本。检索从 `input` 和 `result.hits` 恢复。模型记录携带 `revision`，热重载在处理单元／请求边界实施，协议见 ai-runtime.md。

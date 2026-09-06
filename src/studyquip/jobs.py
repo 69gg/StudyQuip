@@ -19,6 +19,25 @@ JOB_FAMILIES = (
     ("book_process", "book_index"),
     ("question_extract", "question_explain"),
 )
+JOB_RESOURCE_KINDS = {
+    "book_process": "book",
+    "book_index": "book",
+    "page_recognize": "page",
+    "suggestion_regenerate": "suggestion",
+    "question_extract": "question",
+    "question_explain": "question",
+    "model_test": "model",
+    "search": "search",
+    "export_pdf": "export",
+}
+RESUMABLE_STATUSES = ("failed", "cancelled", "waiting_review")
+
+
+def source_fingerprint(record: dict[str, Any], kind: str) -> str:
+    keys = ("title", "subject_id", "text", "asset_ids") if kind == "book" else ("revision",)
+    return hashlib.sha256(
+        json.dumps({key: record.get(key) for key in keys}, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
 
 
 class LeaseLost(RuntimeError):
@@ -405,15 +424,44 @@ class JobStore:
             .values(status="queued", not_before=self.now(conn), error=None, updated_at=self.now(conn))
         )
 
-    def reschedule(self, id: str, not_before: float, bypass_window: bool = False) -> dict[str, Any]:
+    def resume_problem(self, row: dict[str, Any], conn: Connection) -> str | None:
+        """检查恢复前提；执行和提交时仍须再次校验版本与租约。"""
+        if self.active_for(row["kind"], row["resource_id"], conn, row["id"]):
+            return "已有同一内容的处理任务，不能重复恢复旧任务"
+        kind = JOB_RESOURCE_KINDS.get(row["kind"])
+        if kind:
+            source = self.db.get(kind, row["resource_id"], conn)
+            if not source or source.get("deleted"):
+                return "任务来源已删除，不能继续处理"
+            if source.get("book_id"):
+                book = self.db.get("book", source["book_id"], conn)
+                if not book or book.get("deleted"):
+                    return "教材已删除，不能继续处理"
+            expected = (row.get("checkpoint") or {}).get("source_fingerprint")
+            if expected and expected != source_fingerprint(source, kind):
+                return "任务输入已修改，请为当前版本重新发起处理；旧检查点保留"
+        return None
+
+    def resume(self, id: str, not_before: float, bypass_window: bool = False) -> dict[str, Any]:
+        return self.reschedule(id, not_before, bypass_window, resume=True)
+
+    def reschedule(
+        self, id: str, not_before: float, bypass_window: bool = False, *, resume: bool = False
+    ) -> dict[str, Any]:
         with self.db.write() as conn:
             row = self.get(id, conn)
             if not row:
                 raise ValueError("任务不存在")
+            if resume and row["status"] in {"queued", "running", "waiting_window"}:
+                # Double clicks and HTTP retries keep the first submission's schedule and lease.
+                return {**row, "reused": True}
+            if resume and row["status"] not in RESUMABLE_STATUSES:
+                raise ConflictError("该任务已结束，不能继续处理")
             if row["status"] in {"running", "completed"}:
                 raise ValueError("运行中或已完成的任务不能改期；请先取消或创建新任务")
-            if self.active_for(row["kind"], row["resource_id"], conn, id):
-                raise ConflictError("已有同一内容的处理任务，不能重复恢复旧任务")
+            problem = self.resume_problem(row, conn)
+            if problem:
+                raise ConflictError(problem)
             conn.execute(
                 jobs_table.update()
                 .where(jobs_table.c.id == id)

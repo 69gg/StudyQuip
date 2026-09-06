@@ -9,7 +9,7 @@ import {
   formatTime,
   useNotice,
 } from "./ui";
-import { JobProgress, useJobs } from "./JobProgress";
+import { JobProgress, ResumeJobButton, useJobs } from "./JobProgress";
 export default function Tasks() {
   const tasks = useJobs();
   const remote = {
@@ -59,28 +59,19 @@ export default function Tasks() {
             </div>
             <JobProgress job={job} detailed />
             <div className="actions">
-              {["failed", "cancelled"].includes(job.status) && (
-                <Button onClick={() => setSchedule({ job, action: "retry" })}>
-                  重新执行
-                </Button>
-              )}
+              <ResumeJobButton job={job} />
               {[
                 "queued",
                 "deferred",
                 "pending",
                 "waiting",
-                "waiting_review",
                 "waiting_window",
-                "needs_review",
                 "paused",
               ].includes(job.status) && (
                 <Button
                   onClick={() => setSchedule({ job, action: "reschedule" })}
                 >
-                  {job.status === "waiting_review" ||
-                  job.status === "needs_review"
-                    ? "继续处理"
-                    : "调整执行时间"}
+                  调整执行时间
                 </Button>
               )}
               {!["completed", "succeeded", "failed", "cancelled"].includes(
@@ -126,7 +117,7 @@ export default function Tasks() {
       </div>
       {schedule && (
         <ScheduleDialog
-          title={schedule.action === "retry" ? "重新执行任务" : "调整执行时间"}
+          title="调整执行时间"
           onClose={() => setSchedule(null)}
           onSubmit={async (timing) => {
             const result = await post(

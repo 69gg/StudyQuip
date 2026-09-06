@@ -7,9 +7,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api } from "./api";
+import { api, post } from "./api";
 import { jobKindLabels, type Job } from "./types";
-import { Badge, formatTime } from "./ui";
+import { Badge, Button, ScheduleDialog, formatTime } from "./ui";
 
 const POLL_INTERVAL_MS = 3000;
 export const activeStatuses = new Set([
@@ -105,6 +105,32 @@ export function JobsProvider({ children }: { children: ReactNode }) {
   );
 }
 export const useJobs = () => useContext(JobContext);
+export function ResumeJobButton({ job }: { job: Job }) {
+  const [open, setOpen] = useState(false);
+  if (!job.resume?.available) return null;
+  const continuing =
+    job.resume.has_saved_progress || job.status === "waiting_review";
+  const label = continuing ? "继续处理" : "重新执行";
+  return (
+    <>
+      <Button kind="primary" onClick={() => setOpen(true)}>
+        {label}
+      </Button>
+      {open && (
+        <ScheduleDialog
+          title={label}
+          description={
+            continuing
+              ? "保留已完成内容，从未完成阶段继续。"
+              : "此任务还没有可复用的处理结果，将重新尝试。"
+          }
+          onClose={() => setOpen(false)}
+          onSubmit={(timing) => post(`/jobs/${job.id}/resume`, timing)}
+        />
+      )}
+    </>
+  );
+}
 export function useJobCompletion(jobs: Job[], onComplete: () => void) {
   const previous = useRef<Map<string, string>>(new Map());
   const callback = useRef(onComplete);
@@ -226,6 +252,12 @@ export function JobProgress({
             : JSON.stringify(job.error)}
         </p>
       )}
+      {job.resume?.available && job.resume.has_saved_progress && (
+        <p className="hint" role="status">
+          已保存处理进度，可以继续处理，无需从头开始。
+        </p>
+      )}
+      {job.resume?.reason && <p className="hint">{job.resume.reason}</p>}
       {detailed && (
         <>
           <p className="hint">

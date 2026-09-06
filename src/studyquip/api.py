@@ -623,11 +623,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return present_job(jobs.cancel(id))
 
     @application.post("/api/jobs/{id}/retry")
-    def retry_job(id: str) -> dict[str, Any]:
+    @application.post("/api/jobs/{id}/resume")
+    def resume_job(id: str, body: ScheduleInput | None = None) -> dict[str, Any]:
         job = jobs.get(id)
         if not job:
             raise HTTPException(404, "任务不存在")
-        return present_job(jobs.reschedule(id, time.time(), bool(job["bypass_window"])))
+        timing = body or ScheduleInput(bypass_window=bool(job["bypass_window"]))
+        return present_job(jobs.resume(id, timing.timestamp(), timing.bypass_window))
 
     @application.post("/api/jobs/{id}/reschedule")
     def reschedule_job(id: str, body: ScheduleInput) -> dict[str, Any]:

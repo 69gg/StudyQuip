@@ -3,22 +3,199 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from studyquip.ai import AIService, ModelProfile
+from studyquip.api import create_app
+from studyquip.auth import set_password
 from studyquip.config import Settings
-from studyquip.db import ConflictError, Database, initialize
+from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
 from studyquip.pipelines import PipelineContext
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
 from studyquip.worker import Worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
+    tmp_path: Path, legacy_checkpoint: bool
+) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        book = db.put("book", {"title": "续接样本", "asset_ids": []})
+        root = TextbookService(db).ensure_root(book["id"])
+        pages = [
+            db.put(
+                "page",
+                {
+                    "book_id": book["id"],
+                    "index": index,
+                    "page_index": index,
+                    "source_asset_id": "fixture-original",
+                    "status": status,
+                    "text": f"第 {index + 1} 页正文",
+                },
+            )
+            for index, status in enumerate(["processed", "draft", "needs_review"])
+        ]
+        first_block = db.put(
+            "block",
+            {
+                "book_id": book["id"],
+                "node_id": root["id"],
+                "text": pages[0]["text"],
+                "order": 0,
+                "source_page_ids": [pages[0]["id"]],
+            },
+        )
+        db.put(
+            "model",
+            {
+                "role": "chat",
+                "base_url": "https://fixture.invalid/v1",
+                "api_key": "fixture",
+                "model": "fixture",
+                "context_tokens": None,
+                "retries": 0,
+            },
+        )
+        requests: list[dict[str, Any]] = []
+        saved_transcript: list[dict[str, Any]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            wire = json.loads(request.content)
+            requests.append(wire)
+            if len(requests) == 2:
+                # Interrupt after the response and read-tool result have been committed.
+                raise RuntimeError("模拟中断")
+            if len(requests) == 1:
+                name, arguments = "read_block", {"block_id": first_block["id"]}
+            else:
+                assert wire["messages"][2:] == saved_transcript
+                if not legacy_checkpoint:
+                    assert wire["messages"][1] == requests[0]["messages"][1]
+                name, arguments = (
+                    "submit_result",
+                    {
+                        "operations": [
+                            {
+                                "op": "insert",
+                                "id": "continued-block",
+                                "block": {
+                                    "text": pages[1]["text"],
+                                    "node_id": root["id"],
+                                    "type": "paragraph",
+                                },
+                            }
+                        ],
+                        "reason": "续接第二页",
+                        "working_summary": "已完成第二页",
+                        "current_node_id": root["id"],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "opaque-fixture-" * 3000,
+                                "tool_calls": [
+                                    {
+                                        "id": f"call-{len(requests)}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+                },
+            )
+
+        worker = Worker(settings, db, AIService(db, settings, transport=httpx.MockTransport(respond)))
+        jobs = JobStore(db)
+        task = jobs.enqueue("book_process", book["id"])
+        claimed = jobs.claim(worker.owner)
+        assert claimed
+        await worker.execute(claimed)
+        failed = jobs.get(task["id"])
+        assert failed and failed["status"] == "failed" and "模型请求失败" in failed["error"]
+        checkpoint = copy.deepcopy(failed["checkpoint"])
+        stage = checkpoint["stages"][f"revise:{pages[1]['id']}:1:0:0"]
+        assert stage["pending"] == [] and stage["rounds"] == 1
+        saved_transcript = copy.deepcopy(stage["transcript"])
+        assert len(saved_transcript) == 2
+        if legacy_checkpoint:
+            # Existing installations have these transcripts but no initial-input snapshot yet.
+            stage.pop("request_context")
+            checkpoint.pop("revision_plans")
+            with db.write() as conn:
+                conn.execute(
+                    jobs_table.update().where(jobs_table.c.id == task["id"]).values(checkpoint=checkpoint)
+                )
+        else:
+            # New checkpoints must preserve page units and initial inputs across setting edits.
+            settings.context_tokens *= 2
+        set_password(db, "fixture-password")
+        with TestClient(create_app(settings), base_url="http://127.0.0.1:8765") as client:
+            session = client.post("/api/login", json={"password": "fixture-password"}).json()
+            client.headers.update({"X-CSRF-Token": session["csrf_token"]})
+            projected = client.get("/api/jobs").json()[0]
+            assert projected["resume"]["available"] and projected["resume"]["has_saved_progress"]
+            assert projected["progress"]["recognized_pages"] == 2
+            assert projected["progress"]["processed_pages"] == 1
+            assert "opaque-fixture" not in json.dumps(projected) and "checkpoint" not in projected
+            response = client.post(f"/api/jobs/{task['id']}/resume", json={"delay_seconds": 3600})
+            assert response.status_code == 200, response.text
+            scheduled = response.json()
+            assert scheduled["id"] == task["id"] and scheduled["not_before"] > time.time() + 3500
+            repeated = client.post(f"/api/jobs/{task['id']}/resume", json={}).json()
+            assert repeated["reused"] and repeated["not_before"] == scheduled["not_before"]
+            assert jobs.get(task["id"])["checkpoint"] == checkpoint
+            assert jobs.claim(worker.owner) is None
+            assert client.post(f"/api/jobs/{task['id']}/reschedule", json={}).status_code == 200
+        resumed = jobs.claim(worker.owner)
+        assert resumed and resumed["id"] == task["id"] and resumed["lease_token"] != claimed["lease_token"]
+        await worker.execute(resumed)
+        current = jobs.get(task["id"])
+        assert current and current["status"] == "waiting_review"  # The third page still needs review.
+        assert len(requests) == 3  # No repeated recognition, first-page revision, or tool read.
+        assert db.get("page", pages[0]["id"]) == pages[0]
+        assert db.get("block", first_block["id"]) == first_block
+        assert db.get("page", pages[1]["id"])["status"] == "processed"
+        assert len(records(db, "block", {"book_id": book["id"]})) == 2
+        assert len(current["checkpoint"]["completed_units"]) == 1
+        assert current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]["usage"]["requests"] == 2
+        updated = db.put("book", {**book, "title": "用户修改了教材"}, id=book["id"])
+        with pytest.raises(ConflictError, match="输入已修改"):
+            jobs.resume(task["id"], time.time())
+        assert not present_jobs(db)[0]["resume"]["available"]
+        assert jobs.get(task["id"])["checkpoint"] == current["checkpoint"]
+        db.put("book", {**updated, "deleted": True}, id=book["id"])
+        with pytest.raises(ConflictError, match="已删除"):
+            jobs.resume(task["id"], time.time())
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

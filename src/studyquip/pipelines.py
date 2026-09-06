@@ -24,7 +24,7 @@ from studyquip.ai import (
     tool_definition,
 )
 from studyquip.db import ConflictError, Database
-from studyquip.jobs import JobStore
+from studyquip.jobs import JobStore, source_fingerprint
 
 Json = dict[str, Any]
 
@@ -206,13 +206,6 @@ class Summaries(Structured):
 
 class Probe(Structured):
     ok: bool
-
-
-def source_fingerprint(record: Json, kind: str) -> str:
-    keys = ("title", "subject_id", "text", "asset_ids") if kind == "book" else ("revision",)
-    return hashlib.sha256(
-        json.dumps({key: record.get(key) for key in keys}, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
 
 
 class PipelineContext:
@@ -944,14 +937,35 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
     output_reserve = (
         profile.max_output_tokens if profile.max_output_tokens is not None else ctx.settings.output_tokens
     )
+    page_key = f"{page['id']}:{page['revision']}"
+    plan = ctx.data.get("revision_plans", {}).get(page_key, {})
+    # A model/settings edit must not move boundaries underneath completed unit indices.
     builder = ContextBuilder(
-        ctx.db, token_budget=max(2048, input_budget - min(output_reserve, input_budget // 4))
+        ctx.db,
+        token_budget=plan.get(
+            "context_budget", max(2048, input_budget - min(output_reserve, input_budget // 4))
+        ),
     )
     service = TextbookService(ctx.db)
     unit_index = 0
     first_context = await asyncio.to_thread(
-        builder.build, book["id"], page["id"], tools=definitions, unit_index=0
+        builder.build,
+        book["id"],
+        page["id"],
+        tools=definitions,
+        unit_index=0,
+        unit_budget=plan.get("unit_budget"),
     )
+    unit_budget = first_context["current_page"]["unit_budget"]
+    if not plan:
+        await ctx.commit(
+            {
+                "revision_plans": {
+                    **ctx.data.get("revision_plans", {}),
+                    page_key: {"context_budget": builder.token_budget, "unit_budget": unit_budget},
+                }
+            }
+        )
     unit_count = first_context["current_page"].get("unit_count", 1)
     while True:
         if unit_index >= unit_count:
@@ -964,7 +978,12 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
             first_context
             if unit_index == 0
             else await asyncio.to_thread(
-                builder.build, book["id"], page["id"], tools=definitions, unit_index=unit_index
+                builder.build,
+                book["id"],
+                page["id"],
+                tools=definitions,
+                unit_index=unit_index,
+                unit_budget=unit_budget,
             )
         )
         unit_count = context["current_page"].get("unit_count", 1)

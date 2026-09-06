@@ -184,6 +184,7 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
         configured,
         "test",
         Result,
+        images=["data:image/png;base64,private-input-fixture"],
         tools={
             "read": (
                 "read",
@@ -194,6 +195,8 @@ async def test_sdk_tool_loop_preserves_reasoning_items_and_phase(
         state=state,
     )
     assert result.answer == "完成"
+    assert state["request_context"]["image_hashes"]
+    assert "private-input-fixture" not in json.dumps(state)
     assert state["usage"] == {"requests": 2, "input_tokens": 40, "output_tokens": 10}
     if protocol == "chat":
         assert requests[1]["messages"][2]["reasoning_content"] == "vendor opaque reasoning"
@@ -230,23 +233,157 @@ def test_maximum_output_rejects_nonpositive_limits(limit: int) -> None:
         ({"context_tokens": 16384}, 8192),
     ],
 )
-async def test_context_budget_inherits_global_limit_and_rejects_before_request(
+async def test_processing_budget_is_separate_from_optional_request_limit(
     configuration: dict[str, int | None], expected: int
 ) -> None:
     configured = profile(**configuration)
     assert configured.context_tokens == configuration.get("context_tokens")
     assert configured.effective_context_tokens(8192) == expected
 
-    def unexpected_request(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("超出内部预算的请求不应发送给服务商")
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        assert "context_tokens" not in wire
+        requests.append(wire)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "submit",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_result",
+                                        "arguments": '{"answer":"完成"}',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
 
     ai = AIService(
         FakeProfiles([configured]),
         Settings(context_tokens=8192),
-        transport=httpx.MockTransport(unexpected_request),
+        transport=httpx.MockTransport(respond),
     )
-    with pytest.raises(ContextBudgetExceeded):
-        await ai.structured(configured, "测" * (expected * 2), Result)
+    # The complete request exceeds the material budget, but fits an explicit 16k limit.
+    if configured.context_tokens == 4096:
+        with pytest.raises(ContextBudgetExceeded, match="4,096"):
+            await ai.structured(configured, "测" * 3500, Result)
+        assert not requests
+    else:
+        assert (await ai.structured(configured, "测" * 3500, Result)).answer == "完成"
+        assert len(requests) == 1
+    if configured.context_tokens is not None:
+        count = len(requests)
+        with pytest.raises(ContextBudgetExceeded, match="请提高或清空"):
+            await ai.structured(configured, "测" * 10000, Result)
+        assert len(requests) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+async def test_unset_request_limit_resumes_large_reasoning_without_truncating(protocol: str) -> None:
+    configured = profile(protocol=protocol)
+    reasoning = "opaque-reasoning-" * 3000
+    transcript = (
+        [
+            {
+                "role": "assistant",
+                "content": "读取原文",
+                "reasoning_content": reasoning,
+                "tool_calls": [
+                    {
+                        "id": "read-call",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "read-call", "content": "已读取的原文"},
+        ]
+        if protocol == "chat"
+        else [
+            {"type": "reasoning", "id": "reasoning-item", "summary": [], "encrypted_content": reasoning},
+            {
+                "type": "function_call",
+                "id": "read-item",
+                "call_id": "read-call",
+                "name": "read",
+                "arguments": "{}",
+                "status": "completed",
+            },
+            {"type": "function_call_output", "call_id": "read-call", "output": "已读取的原文"},
+        ]
+    )
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        requests.append(wire)
+        assert "context_tokens" not in wire
+        assert (wire["messages"] if protocol == "chat" else wire["input"])[-len(transcript) :] == transcript
+        if protocol == "chat":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "submit",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "submit_result",
+                                            "arguments": '{"answer":"完成"}',
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "submit-item",
+                        "call_id": "submit",
+                        "name": "submit_result",
+                        "arguments": '{"answer":"完成"}',
+                        "status": "completed",
+                    }
+                ],
+            },
+        )
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {
+        "binding": ai.binding(configured),
+        "transcript": copy.deepcopy(transcript),
+        "pending": [],
+        "rounds": 1,
+        "usage": {"requests": 1, "input_tokens": 100, "output_tokens": 200},
+    }
+    assert (await ai.structured(configured, "当前页只有少量文字", Result, state=state)).answer == "完成"
+    assert len(requests) == 1 and state["usage"]["requests"] == 2
 
 
 @pytest.mark.asyncio

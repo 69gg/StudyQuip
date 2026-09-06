@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from .db import Database
-from .jobs import ACTIVE_STATUSES, JobStore
+from .jobs import ACTIVE_STATUSES, JOB_RESOURCE_KINDS, RESUMABLE_STATUSES, JobStore
 
 
 class JobProgress:
@@ -61,17 +61,7 @@ class JobProgress:
         return result
 
     def present(self, job: dict[str, Any]) -> dict[str, Any]:
-        kind = {
-            "book_process": "book",
-            "book_index": "book",
-            "page_recognize": "page",
-            "suggestion_regenerate": "suggestion",
-            "question_extract": "question",
-            "question_explain": "question",
-            "model_test": "model",
-            "search": "search",
-            "export_pdf": "export",
-        }.get(job["kind"])
+        kind = JOB_RESOURCE_KINDS.get(job["kind"])
         source = self.db.get(kind, job["resource_id"], self.conn) if kind else None
         source = source or {}
         book_id = job["resource_id"] if kind == "book" else source.get("book_id")
@@ -116,6 +106,14 @@ class JobProgress:
         if checkpoint.get("embedding_activity"):
             progress["embedding_activity"] = checkpoint["embedding_activity"]
         recovering = job["status"] == "running" and (job.get("lease_until") or 0) <= self.now
+        resumable = job["status"] in RESUMABLE_STATUSES
+        resume_problem = JobStore(self.db).resume_problem(job, self.conn) if resumable else None
+        has_saved_progress = bool(
+            stages
+            or checkpoint.get("completed_units")
+            or checkpoint.get("embedding_completed")
+            or (job["kind"] == "book_process" and book.get("total_pages"))
+        )
         return {
             **{
                 key: job.get(key)
@@ -139,6 +137,11 @@ class JobProgress:
             "question_ids": source.get("question_ids", []) if kind == "export" else [],
             "blocking": job["status"] in ACTIVE_STATUSES,
             "recovering": recovering,
+            "resume": {
+                "available": resumable and resume_problem is None,
+                "has_saved_progress": has_saved_progress,
+                "reason": resume_problem,
+            },
             "progress": progress,
             "waiting_reason": "执行进程已离线或租约过期，等待 worker 恢复；请勿重复提交"
             if recovering
