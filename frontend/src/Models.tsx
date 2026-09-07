@@ -6,7 +6,12 @@ import {
   matchingJobs,
   isActiveJob,
 } from "./JobProgress";
-import { roleLabels, type Model, type Subject } from "./types";
+import {
+  roleDescriptions,
+  roleLabels,
+  type Model,
+  type Subject,
+} from "./types";
 import {
   Button,
   Check,
@@ -35,7 +40,7 @@ export default function Models({
       id: "",
       revision: 0,
       name: "",
-      role: "chat",
+      role: "question_text",
       protocol: "chat",
       base_url: "",
       model: "",
@@ -77,7 +82,7 @@ export default function Models({
         error={remote.error}
         empty={!remote.data.length}
       >
-        先配置视觉、讲解和向量嵌入模型。视觉与讲解可以使用同一个模型。
+        分别配置教材与题目的图片、文本模型，再按需配置向量嵌入模型。不同用途可以使用同一个模型。
       </State>
       <div className="record-list">
         {remote.data.map((model) => (
@@ -283,7 +288,7 @@ function ModelEditor({
               placeholder="便于识别的名称"
             />
           </Field>
-          <Field label="用途">
+          <Field label="用途" hint={roleDescriptions[model.role]}>
             <select
               value={model.role}
               onChange={(e) => update("role", e.target.value as Model["role"])}

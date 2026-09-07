@@ -101,7 +101,7 @@ describe("首页的实际数据与待处理状态", () => {
       id: "vision",
       revision: 1,
       name: "识别模型",
-      role: "vision",
+      role: "question_vision",
       protocol: "chat",
       base_url: "https://models.example.invalid/v1",
       model: "example-model",
@@ -121,7 +121,7 @@ describe("首页的实际数据与待处理状态", () => {
     };
     const configured: Model[] = [
       vision,
-      { ...vision, id: "chat", role: "chat" },
+      { ...vision, id: "chat", role: "question_text" },
     ];
     const subjects: Subject[] = [{ id: "subject", revision: 1, name: "数学" }];
     const books: Book[] = [
@@ -136,5 +136,11 @@ describe("首页的实际数据与待处理状态", () => {
     expect(
       setupSteps(subjects, books, configured).map((step) => step.href),
     ).toEqual(["#questions?new=1"]);
+    expect(
+      setupSteps(subjects, books, [
+        { ...vision, role: "book_vision" },
+        { ...vision, id: "book-text", role: "book_text" },
+      ]).map((step) => step.href),
+    ).toEqual(["#settings", "#questions?new=1"]);
   });
 });

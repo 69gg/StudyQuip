@@ -20,6 +20,10 @@
 
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 
+`ai.ModelRole` 为 `book_vision|book_text|question_vision|question_text|embedding`。`AIService.profile_for(role=None,explicit_id=None)` 必须指定用途或 ID；连接测试使用 ID，其余生成按用途读取。教材草稿用 `book_vision`，修订、概述和建议用 `book_text`；题目有题图或参考图时用 `question_vision`，纯文字提取及讲解用 `question_text`；索引及查询向量共用 `embedding`。当前 API 新增配置默认 `question_text`，不再接受旧用途作为新配置。
+
+`ai.split_legacy_model_roles(db)->int` 由 Web lifespan 和 `Worker.run()` 在服务请求／认领任务前调用，返回转换的旧记录数。旧 `vision` 原 ID 改为 `book_vision` 并复制 `question_vision`；旧 `chat` 原 ID 改为 `book_text` 并复制 `question_text`。复制 ID 使用 `uuid5(NAMESPACE_URL,"studyquip:model:{source_id}:{role}")`；字段完整继承，嵌入不变。同一短写事务重新检测旧用途并提交全部改动，不引入新表或付费请求。已转换记录后续不会再次填充，已有复制记录不覆盖。绑定 HMAC 将新的图片／文本用途映射回旧分类保持兼容，只有拆分用途时不清掉未完成工具链。凭据与模型桶的身份定义保持独立于用途。
+
 worker 公共入口 `async run_worker(settings)`。CLI 提供 doctor/init/upgrade/password/web/worker/run。
 
 `Worker.run()` 在认领前调用 `JobStore.restore_review_pages()->int`，逐页短事务恢复未删除教材的 `needs_review` 页面。`TextbookService.restore_review_page(book_id,page_id,conn)` 保留人工编辑，否则采用已有 AI 候选，无候选保留当前文本；转为 `draft` 并移除旧质量字段，历史仍递增。只有旧页面质量等待被重新排队，不改变预约、检查点或其他终态。识别入口复用同一转换；新 `PageDraft{text:string,is_blank:boolean=false}` 兼容忽略旧 `quality/issues`，识别成功即存草稿，无质量补救请求。
@@ -53,7 +57,7 @@ GET/POST /api/books；GET/PUT/DELETE /api/books/{id}，fields title,subject_id,t
 
 教材的 `extra_processing_budget` 可为空；有限预算耗尽后增加预算会恢复索引任务。页面 `index` 是整本输入顺序，`page_index` 是原 PDF 内部页号。删除教材会在同一事务取消教材及页面／建议的相关任务，worker 提交时仍复核父教材状态。
 
-GET/POST /api/models；PUT/DELETE /api/models/{id}；POST /api/models/{id}/test。Model fields name,role(vision|chat|embedding),protocol(chat|responses),base_url,api_key(读不返回),model,thinking(omit|enabled|disabled),reasoning_effort,temperature,top_p,max_output_tokens,max_tokens_field(max_completion_tokens|max_tokens),context_tokens,timeout_seconds,retries,max_tool_rounds,max_concurrency(default4),credential_max_concurrency(null),store(false),strict_tools(bool),extra_body(object),organization,project,auth_scope,windows([{start:"HH:MM",end:"HH:MM"}]),timezone,embedding_dimensions,embedding_revision,document_prefix,query_prefix。读返回 has_api_key、effective_max_concurrency。
+GET/POST /api/models；PUT/DELETE /api/models/{id}；POST /api/models/{id}/test。Model fields name,role(book_vision|book_text|question_vision|question_text|embedding),protocol(chat|responses),base_url,api_key(读不返回),model,thinking(omit|enabled|disabled),reasoning_effort,temperature,top_p,max_output_tokens,max_tokens_field(max_completion_tokens|max_tokens),context_tokens,timeout_seconds,retries,max_tool_rounds,max_concurrency(default4),credential_max_concurrency(null),store(false),strict_tools(bool),extra_body(object),organization,project,auth_scope,windows([{start:"HH:MM",end:"HH:MM"}]),timezone,embedding_dimensions,embedding_revision,document_prefix,query_prefix。读返回 has_api_key、effective_max_concurrency。
 
 POST /api/assets multipart file；GET /api/assets/{id}/file 与 /preview；POST /api/assets/{id}/crop {box:[x1,y1,x2,y2]}（归正图像素坐标）。POST /api/search {query,subject_id?,book_ids?,node_id?,mode:hybrid|keyword|phrase|semantic,keyword_mode:any|all,limit?}。
 
@@ -74,3 +78,5 @@ GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/export
 同一投影的 `resume:{available,has_saved_progress,reason}` 驱动续接入口和不可续接提示；`request_context` 与完整工具转录不得进入此响应。前端共用 `ResumeJobButton` 与原预约弹窗，提交后利用已有任务事件同步状态。
 
 前端 `JobsProvider` 在工作台路由外共享状态，写操作通过 `studyquip:jobs-changed` 通知立即合并任务并刷新；轮询间隔集中为 3000 ms。处理按钮在加载／错误／已有活动任务时禁用；任务结束通知对应页面刷新已提交结果，原页编辑保留未保存文本与基础版本。检索从 `input` 和 `result.hits` 恢复。模型记录携带 `revision`，热重载在处理单元／请求边界实施，协议见 ai-runtime.md。
+
+前端 `roleLabels/roleDescriptions` 定义五种用途及职责，模型列表、用途选择和字段说明复用；首页的题目录入引导检查 `question_vision/question_text`，仅配置教材用途不视为题目模型已就绪。

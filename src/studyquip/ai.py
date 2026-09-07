@@ -10,8 +10,9 @@ import json
 import math
 import time
 import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -27,11 +28,26 @@ from studyquip.scheduling import (
     parse_retry_after,
 )
 
+if TYPE_CHECKING:
+    from studyquip.db import Database
+
 Json = dict[str, Any]
 SaveState = Callable[[Json], Awaitable[None]]
 BeforeRequest = Callable[[], Awaitable[None]]
 ToolHandler = Callable[[Json], Awaitable[Any]]
 ResultModel = TypeVar("ResultModel", bound=BaseModel)
+ModelRole = Literal["book_vision", "book_text", "question_vision", "question_text", "embedding"]
+MODEL_ROLE_LABELS: dict[ModelRole, str] = {
+    "book_vision": "教材图片模型",
+    "book_text": "教材文本模型",
+    "question_vision": "题目图片模型",
+    "question_text": "题目文本模型",
+    "embedding": "向量嵌入模型",
+}
+LEGACY_MODEL_ROLES: dict[str, tuple[ModelRole, ModelRole]] = {
+    "vision": ("book_vision", "question_vision"),
+    "chat": ("book_text", "question_text"),
+}
 
 
 class ModelProfile(BaseModel):
@@ -39,7 +55,7 @@ class ModelProfile(BaseModel):
     id: str = ""
     revision: int = 0
     name: str = ""
-    role: Literal["vision", "chat", "embedding"] = "chat"
+    role: ModelRole = "question_text"
     protocol: Literal["chat", "responses"] = "chat"
     base_url: str
     api_key: str = Field(repr=False)
@@ -123,6 +139,43 @@ class ModelProfile(BaseModel):
         if reasoning is not None and (not isinstance(reasoning, dict) or "effort" in reasoning):
             raise ValueError("reasoning.effort 请使用专用表单字段")
         return self
+
+
+def split_legacy_model_roles(db: Database) -> int:
+    """Copy legacy generation settings once, atomically for Web/worker startup."""
+    from sqlalchemy import select
+
+    from .db import records
+    from .jobs import JobStore
+
+    query = (
+        select(records)
+        .where(records.c.kind == "model", records.c.data["role"].as_string().in_(LEGACY_MODEL_ROLES))
+        .order_by(records.c.created_at, records.c.id)
+    )
+    with db.read() as conn:
+        if conn.execute(query.limit(1)).first() is None:
+            return 0
+    converted = 0
+    with db.write() as conn:
+        # Re-read under BEGIN IMMEDIATE: two starting processes cannot split twice.
+        for row in conn.execute(query).mappings().all():
+            original = row["data"]
+            book_role, question_role = LEGACY_MODEL_ROLES[original["role"]]
+            db.put(
+                "model",
+                {**original, "role": book_role},
+                id=row["id"],
+                expected_revision=row["revision"],
+                conn=conn,
+            )
+            question_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"studyquip:model:{row['id']}:{question_role}"))
+            if db.get("model", question_id, conn=conn) is None:
+                db.put("model", {**original, "role": question_role}, id=question_id, conn=conn)
+            converted += 1
+        if converted:
+            JobStore(db).configuration_changed(conn)
+    return converted
 
 
 class AIProtocolError(RuntimeError):
@@ -236,7 +289,11 @@ class AIService:
         records = await asyncio.to_thread(self.db.list, "model")
         return [ModelProfile.model_validate(record) for record in records]
 
-    async def profile_for(self, role: str, explicit_id: str | None = None) -> ModelProfile:
+    async def profile_for(
+        self, role: ModelRole | None = None, explicit_id: str | None = None
+    ) -> ModelProfile:
+        if role is None and explicit_id is None:
+            raise ValueError("需要指定模型用途或配置 ID")
         profiles = await self.profiles()
         matches = (
             [profile for profile in profiles if profile.id == explicit_id]
@@ -244,7 +301,8 @@ class AIService:
             else [profile for profile in profiles if profile.role == role]
         )
         if not matches:
-            raise AIProtocolError(f"请先在设置中配置 {role} 模型")
+            label = MODEL_ROLE_LABELS[role] if role else "指定的模型配置"
+            raise AIProtocolError(f"请先在设置中配置{label}")
         return matches[0]
 
     async def refresh_profile(self, profile: ModelProfile) -> ModelProfile:
@@ -271,6 +329,12 @@ class AIService:
                 "timezone",
             },
         )
+        # Product routing does not alter the wire protocol. Preserve old checkpoint fingerprints
+        # when the only change is copying a legacy profile into book/question roles.
+        for legacy, roles in LEGACY_MODEL_ROLES.items():
+            if profile.role in roles:
+                fields["role"] = legacy
+                break
         fingerprint = hmac.new(
             self.db.secret(), json.dumps(fields, sort_keys=True).encode(), hashlib.sha256
         ).hexdigest()

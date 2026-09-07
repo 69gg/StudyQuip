@@ -106,7 +106,12 @@ export type RequestActivity = {
 };
 export type Model = Entity & {
   name: string;
-  role: "vision" | "chat" | "embedding";
+  role:
+    | "book_vision"
+    | "book_text"
+    | "question_vision"
+    | "question_text"
+    | "embedding";
   protocol: "chat" | "responses";
   base_url: string;
   api_key?: string;
@@ -164,9 +169,18 @@ export const questionTypes: Record<QuestionType, string> = {
   short_answer: "简答题",
 };
 export const roleLabels: Record<Model["role"], string> = {
-  vision: "视觉模型",
-  chat: "讲解模型",
+  book_vision: "教材图片模型",
+  book_text: "教材文本模型",
+  question_vision: "题目图片模型",
+  question_text: "题目文本模型",
   embedding: "向量嵌入模型",
+};
+export const roleDescriptions: Record<Model["role"], string> = {
+  book_vision: "识别教材图片与 PDF 页面，提取文字和插图描述。",
+  book_text: "顺序整理教材、衔接跨页内容、生成目录概述与修改建议。",
+  question_vision: "识别题目图片和参考解析图片，提取题目字段。",
+  question_text: "整理纯文本题目，生成讲解、知识点与已勾选的错因优化。",
+  embedding: "生成教材与查询文本的向量，供语义检索使用。",
 };
 export const jobKindLabels: Record<string, string> = {
   model_test: "模型连接测试",

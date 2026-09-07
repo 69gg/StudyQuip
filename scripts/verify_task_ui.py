@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Route, async_playwright, expect
 
-from studyquip.ai import ModelProfile
+from studyquip.ai import MODEL_ROLE_LABELS, ModelProfile
 
 
 async def verify() -> dict[str, Any]:
@@ -56,6 +56,14 @@ async def verify() -> dict[str, Any]:
         api_key="fixture",
         model="fixture",
     ).model_dump(exclude={"api_key"})
+    models = [
+        model,
+        *(
+            {**model, "id": role, "name": label, "role": role, "model": f"fixture-{role}"}
+            for role, label in MODEL_ROLE_LABELS.items()
+            if role != "embedding"
+        ),
+    ]
 
     def job(kind: str, resource_id: str) -> dict[str, Any]:
         return {
@@ -110,7 +118,7 @@ async def verify() -> dict[str, Any]:
         ],
         "/api/questions": [question],
         "/api/questions/question": question,
-        "/api/models": [model],
+        "/api/models": models,
         "/api/jobs": jobs,
     }
     api_failure = False
@@ -180,6 +188,31 @@ async def verify() -> dict[str, Any]:
             await expect(page.get_by_role("button", name="已有处理任务", exact=True)).to_be_disabled()
             await page.goto("http://studyquip.test/#settings")
             await expect(page.get_by_role("button", name="测试已安排", exact=True)).to_be_disabled()
+            for label in MODEL_ROLE_LABELS.values():
+                await expect(page.locator(".record-meta").get_by_text(label, exact=True)).to_be_visible()
+            await page.screenshot(path=str(output / "models-mobile-dark.png"), full_page=True)
+            await (
+                page.locator(".model-row")
+                .filter(has=page.locator(".record-meta").get_by_text("教材文本模型", exact=True))
+                .get_by_role("button", name="编辑", exact=True)
+                .click()
+            )
+            purpose = page.get_by_label("用途", exact=False)
+            await expect(purpose).to_have_value("book_text")
+            assert await purpose.locator("option").all_text_contents() == list(MODEL_ROLE_LABELS.values())
+            for role in MODEL_ROLE_LABELS:
+                await purpose.select_option(role)
+                await expect(purpose).to_have_value(role)
+            await purpose.select_option("book_text")
+            await expect(
+                page.get_by_text("顺序整理教材、衔接跨页内容、生成目录概述与修改建议。", exact=True)
+            ).to_be_visible()
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            await page.screenshot(path=str(output / "model-purpose-mobile-dark.png"), full_page=True)
+            await page.set_viewport_size({"width": 1280, "height": 900})
+            await page.screenshot(path=str(output / "model-purpose-desktop-dark.png"), full_page=True)
+            await page.get_by_role("button", name="关闭窗口", exact=True).click()
+            await page.set_viewport_size({"width": 390, "height": 844})
             await page.goto("http://studyquip.test/#questions")
             await page.get_by_role("checkbox", name="选择此题导出", exact=True).check()
             await page.get_by_role("button", name="导出 PDF · 1", exact=True).click()
@@ -224,6 +257,7 @@ async def verify() -> dict[str, Any]:
         "unsaved_page_edits_preserved": True,
         "home_shares_task_progress": True,
         "expired_lease_and_api_failure_guarded": True,
+        "separate_model_purposes": list(MODEL_ROLE_LABELS),
         "mobile_overflow": False,
         "browser_errors": errors,
     }

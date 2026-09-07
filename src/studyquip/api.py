@@ -43,10 +43,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        with runtime_lock(config):
-            application.state.db = db
-            yield
-        db.close()
+        from .ai import split_legacy_model_roles
+
+        try:
+            with runtime_lock(config):
+                await asyncio.to_thread(split_legacy_model_roles, db)
+                application.state.db = db
+                yield
+        finally:
+            db.close()
 
     application = FastAPI(
         title="StudyQuip", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None

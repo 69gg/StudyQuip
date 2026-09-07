@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import time
 from pathlib import Path
@@ -12,19 +13,119 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from studyquip.ai import AIService, ModelProfile
+from studyquip.ai import AIService, ModelProfile, split_legacy_model_roles
 from studyquip.api import create_app
 from studyquip.auth import set_password
 from studyquip.config import Settings
 from studyquip.context import node_source_fingerprint
 from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
+from studyquip.media import store_upload
 from studyquip.pipelines import PipelineContext
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
 from studyquip.worker import Worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_first", [False, True])
+async def test_legacy_models_split_once_and_new_roles_remain_independently_editable(
+    tmp_path: Path,
+    worker_first: bool,
+) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        originals: dict[str, dict[str, Any]] = {}
+        for legacy in ("vision", "chat"):
+            profile = ModelProfile(
+                name=f"旧 {legacy}",
+                base_url="https://fixture.invalid/tenant/v1",
+                api_key="private-fixture-key",
+                model=f"original-{legacy}",
+                protocol="responses" if legacy == "chat" else "chat",
+                thinking="enabled",
+                reasoning_effort="max",
+                max_concurrency=16,
+                credential_max_concurrency=20,
+                extra_body={"seed": 7},
+                organization="fixture-org",
+                project="fixture-project",
+                auth_scope="fixture-scope",
+                windows=[{"start": "23:00", "end": "06:00"}],
+            )
+            originals[legacy] = db.put("model", {**profile.model_dump(mode="json"), "role": legacy})
+        embedding = db.put(
+            "model",
+            {
+                **ModelProfile(
+                    base_url="https://fixture.invalid/v1", api_key="vector-fixture", model="embedding"
+                ).model_dump(),
+                "role": "embedding",
+                "embedding_dimensions": 4096,
+            },
+        )
+        ai = AIService(db, settings)
+        worker = Worker(settings, db, ai)
+        stop = asyncio.Event()
+        stop.set()
+        if worker_first:
+            # Separate startup callers share one short transaction; no server or model is started.
+            await asyncio.gather(worker.run(stop), asyncio.to_thread(split_legacy_model_roles, db))
+        set_password(db, "fixture-password")
+        with TestClient(create_app(settings), base_url="http://127.0.0.1:8765") as client:
+            session = client.post("/api/login", json={"password": "fixture-password"}).json()
+            client.headers.update({"X-CSRF-Token": session["csrf_token"]})
+            public = client.get("/api/models").json()
+            assert {item["role"] for item in public} == {
+                "book_vision",
+                "book_text",
+                "question_vision",
+                "question_text",
+                "embedding",
+            }
+            assert len(public) == 5 and all("api_key" not in item for item in public)
+            assert "private-fixture-key" not in json.dumps(public)
+            profiles = {profile.role: profile for profile in await ai.profiles()}
+            for legacy, roles in {
+                "vision": ("book_vision", "question_vision"),
+                "chat": ("book_text", "question_text"),
+            }.items():
+                original = originals[legacy]
+                for role in roles:
+                    record = db.get("model", profiles[role].id)
+                    for field, value in original.items():
+                        if field not in {"id", "revision", "created_at", "updated_at", "role"}:
+                            assert record[field] == value
+                    assert (await ai.profile_for(role)).id == record["id"]
+                    assert (await ai.profile_for(explicit_id=record["id"])).role == role
+                assert profiles[roles[0]].id == original["id"]
+                assert profiles[roles[1]].id != original["id"]
+                assert (
+                    ai.binding(profiles[roles[0]])["fingerprint"]
+                    == ai.binding(profiles[roles[1]])["fingerprint"]
+                )
+            assert db.get("model", embedding["id"]) == embedding
+
+            question = next(item for item in public if item["role"] == "question_text")
+            saved = client.put(f"/api/models/{question['id']}", json={**question, "reasoning_effort": "low"})
+            assert saved.status_code == 200, saved.text
+            assert (await ai.profile_for("question_text")).reasoning_effort == "low"
+            assert (await ai.profile_for("book_text")).reasoning_effort == "max"
+            assert (await ai.profile_for("question_text")).api_key == "private-fixture-key"
+            assert client.delete(f"/api/models/{profiles['question_vision'].id}").status_code == 200
+        after = db.list("model")
+        # Startup never re-fills a deliberate deletion or overwrites an edited split profile.
+        await worker.run(stop)
+        with TestClient(create_app(settings)):
+            assert db.list("model") == after
+        assert split_legacy_model_roles(db) == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -154,7 +255,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         configured = db.put(
             "model",
             {
-                "role": "chat",
+                "role": "book_text",
                 "base_url": "https://fixture.invalid/v1",
                 "api_key": "fixture",
                 "model": "fixture",
@@ -242,6 +343,8 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
             # Existing installations have these transcripts but no initial-input snapshot yet.
             stage.pop("request_context")
             checkpoint.pop("revision_plans")
+            # Startup also upgrades legacy roles without invalidating compatible saved tool history.
+            db.put("model", {**configured, "role": "chat"}, id=configured["id"])
             with db.write() as conn:
                 conn.execute(
                     jobs_table.update().where(jobs_table.c.id == task["id"]).values(checkpoint=checkpoint)
@@ -319,17 +422,18 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
         "book",
         {"title": "物理", "subject_id": subject["id"], "text": "牛顿第一定律又称惯性定律。", "asset_ids": []},
     )
-    db.put(
-        "model",
-        {
-            "name": "mock",
-            "role": "chat",
-            "base_url": "https://provider.example/v1",
-            "api_key": "fixture",
-            "model": "fixture",
-            "context_tokens": None,
-        },
-    )
+    for role in ("book_text", "question_vision", "question_text"):
+        db.put(
+            "model",
+            {
+                "name": role,
+                "role": role,
+                "base_url": "https://provider.example/v1",
+                "api_key": "fixture",
+                "model": f"fixture-{role}",
+                "context_tokens": None,
+            },
+        )
     db.put(
         "model",
         {
@@ -366,6 +470,7 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
             )
         prompt = wire["messages"][1]["content"][0]["text"]
         if "按原始顺序把当前教材草稿" in prompt:
+            assert wire["model"] == "fixture-book_text"
             result: dict[str, Any] = {
                 "operations": [
                     {
@@ -394,6 +499,7 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
                 "closed_node_ids": [],
             }
         elif "生成简短概述" in prompt:
+            assert wire["model"] == "fixture-book_text"
             payload = json.loads(prompt.split("\n", 1)[1])
             result = {
                 "summaries": [
@@ -401,6 +507,8 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
                 ]
             }
         elif "识别一道错题" in prompt:
+            role = "question_vision" if len(wire["messages"][1]["content"]) > 1 else "question_text"
+            assert wire["model"] == f"fixture-{role}"
             result = {
                 "type": "short_answer",
                 "stem": "牛顿第一定律又称什么？",
@@ -409,6 +517,7 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
                 "reference_analysis": "参考答案给出了惯性定律。",
             }
         elif "生成讲解、分步分析" in prompt:
+            assert wire["model"] == "fixture-question_text"
             explanation_inputs.append(json.loads(prompt.rsplit("\n", 1)[1]))
             result = {
                 "summary": "牛顿第一定律也称惯性定律。",
@@ -498,6 +607,14 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
     assert current and current["answer"] == "惯性定律" and current["answer_confirmed"] is False
     assert current["notes"] == "保留我的备注"
     assert current["error_reason"] == original_reason
+    with io.BytesIO() as image_bytes:
+        Image.new("RGB", (8, 8), "white").save(image_bytes, format="PNG")
+        asset = store_upload(settings, "reference.png", image_bytes.getvalue())
+    asset = db.put("asset", asset, id=asset["id"])
+    current = db.put("question", {**current, "reference_asset_ids": [asset["id"]]}, id=current["id"])
+    jobs.enqueue("question_extract", question["id"])
+    await run_next()  # Reference images use question_vision, not a textbook model.
+    current = db.get("question", question["id"])
     current = db.put(
         "question",
         {**current, "answer_confirmed": True},
@@ -593,7 +710,7 @@ async def test_unlimited_summary_and_embedding_batches_do_not_reuse_old_partial_
                 },
                 id=f"{node['id']}:{fingerprint}:0",
             )
-        for role in ("chat", "embedding"):
+        for role in ("book_text", "embedding"):
             db.put(
                 "model",
                 {
@@ -799,8 +916,11 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
             jobs.enqueue("model_test", model["id"])
         execution = asyncio.create_task(worker.run(stop))
     else:
-        db.put("model", profile.model_copy(update={"role": "vision"}).model_dump())
-        db.put("model", profile.model_copy(update={"model": "revision-fixture"}).model_dump())
+        db.put("model", profile.model_copy(update={"role": "book_vision"}).model_dump())
+        db.put(
+            "model",
+            profile.model_copy(update={"role": "book_text", "model": "revision-fixture"}).model_dump(),
+        )
         book = db.put("book", {"title": "并行页识别验收", "asset_ids": []})
         TextbookService(db).ensure_root(book["id"])
         for index in range(count):

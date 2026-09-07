@@ -78,14 +78,14 @@ export function setupSteps(
 ): SetupStep[] {
   const steps: SetupStep[] = [];
   const hasCoreModels =
-    models.some((model) => model.role === "vision") &&
-    models.some((model) => model.role === "chat");
+    models.some((model) => model.role === "question_vision") &&
+    models.some((model) => model.role === "question_text");
   if (!subjects.length || !hasCoreModels) {
     steps.push({
-      title: !subjects.length ? "设置科目与模型" : "配置识别与讲解模型",
+      title: !subjects.length ? "设置科目与模型" : "配置题目图片与文本模型",
       description: !subjects.length
         ? "添加常用科目，再填写模型连接信息。"
-        : "配置视觉模型和讲解模型，开始识别与整理。",
+        : "配置题目的图片识别与文本讲解，教材模型可单独设置。",
       href: "#settings",
       action: "前往设置",
     });

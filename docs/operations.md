@@ -48,6 +48,8 @@ worker 认领可执行任务、教材页草稿并行识别不再额外限制为 
 
 Web UI 中的模型配置支持热重载。保存后，新的处理单元、教材下一页／下一次概述调用／下一批嵌入读取最新值；已经发出的请求和同一工具调用链继续使用原模型、凭据、协议与生成参数。并发、窗口、超时及重试在后续请求中刷新；已等待窗口的任务重新判断时间，不提前用户的未来预约。应用级 `.env`、监听地址、数据目录和全局预算仍需重新启动进程。完整生效边界见 [AI 运行协议](ai-runtime.md#模型配置热重载)。
 
+模型配置分教材图片／教材文本、题目图片／题目文本和向量嵌入五种用途。升级这次用途拆分时，完整重启 Web 和 worker，随后刷新浏览器；任一进程启动时会在短事务中将旧视觉配置复制给两个图片用途，将旧讲解配置复制给两个文本用途。所有连接、生成、预约窗口和并发参数继承，嵌入保持原样。此操作不改变数据库结构，无需为此运行 Alembic 升级；不发模型请求，不重新生成教材。检测转换只执行一次，之后编辑或删除某用途不会在下次启动时被旧值覆盖；没有旧配置的用途仍需自行填写。
+
 只更换嵌入 API Key 或并发不要求重建向量；更换模型、维度或语义设置后使用新空间。进行中的索引任务会在批次边界自行重新规划；已完成教材需手动发起一次整理／索引来补齐新空间，不自动增加收费任务。
 
 ## 数据库和迁移
@@ -56,7 +58,7 @@ Web 和 worker 在生命周期内持有 `.schema.lock` 共享锁，迁移持独�
 
 写 engine 显式 BEGIN IMMEDIATE，读 engine 使用 mode=ro、query_only=ON 和普通 BEGIN。模型网络、图片处理和 PDF 渲染都不占写事务。每次连接配置 foreign_keys、busy_timeout 和 synchronous=FULL。SQLite WAL 在初始化／升级侧设置。
 
-升级流程：停止两个进程 → 备份完整 data 目录 → `uv run studyquip upgrade` → `uv run studyquip doctor` → 启动应用。运行进程不自动迁移。
+数据库结构升级流程：停止两个进程 → 备份完整 data 目录 → `uv run studyquip upgrade` → `uv run studyquip doctor` → 启动应用。运行进程不自动执行结构迁移；上述模型用途兼容转换属于已有 JSON 配置的数据更新，在启动时自动执行。
 
 `studyquip run` 在 POSIX 系统向子进程发送 SIGTERM；Windows 将 Web 和 worker 放在独立进程组，以 CTRL_BREAK_EVENT 请求清理，worker 处理 SIGBREAK。不能将 Windows 的 `Popen.terminate()` 当作可拦截的 SIGTERM：它调用 TerminateProcess，见 [Python 子进程文档](https://docs.python.org/3/library/subprocess.html#subprocess.Popen.terminate)。控制台事件不可用或子进程未在退出时限内结束时，启动器才使用强制终止兜底；正常使用请在启动终端按 Ctrl+C 停止。
 

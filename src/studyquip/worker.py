@@ -14,7 +14,7 @@ from typing import Any
 
 from sqlalchemy.exc import OperationalError
 
-from studyquip.ai import AIService
+from studyquip.ai import AIService, split_legacy_model_roles
 from studyquip.config import Settings
 from studyquip.db import Database, runtime_lock
 from studyquip.jobs import JobStore, LeaseLost
@@ -111,6 +111,9 @@ class Worker:
         stop = stop or asyncio.Event()
         active: set[asyncio.Task[None]] = set()
         try:
+            converted = await asyncio.to_thread(split_legacy_model_roles, self.db)
+            if converted:
+                logger.info("已拆分 %s 个旧模型配置为教材与题目用途", converted)
             restored = await asyncio.to_thread(self.jobs.restore_review_pages)
             if restored:
                 logger.info("已将 %s 个旧待校对页面恢复为草稿", restored)

@@ -14,7 +14,7 @@ from studyquip.scheduling import CapacityLimiter, Window, model_bucket, next_all
 from studyquip.worker import with_heartbeat
 
 
-def configured(model: str, role: str = "chat", limit: int = 2, total: int | None = 3) -> ModelProfile:
+def configured(model: str, role: str = "book_text", limit: int = 2, total: int | None = 3) -> ModelProfile:
     return ModelProfile(
         base_url="https://provider.example/v1",
         api_key="fixture",
@@ -32,8 +32,14 @@ def test_cross_midnight_window_and_role_independent_identity() -> None:
     assert next_allowed(now, windows, "Asia/Shanghai") == now
     noon = datetime(2026, 9, 6, 12, tzinfo=zone).timestamp()
     assert next_allowed(noon, windows, "Asia/Shanghai") == datetime(2026, 9, 6, 23, tzinfo=zone).timestamp()
-    assert model_bucket(b"secret", configured("same", "vision")) == model_bucket(
-        b"secret", configured("same", "chat")
+    assert (
+        len(
+            {
+                model_bucket(b"secret", configured("same", role))
+                for role in ("book_vision", "book_text", "question_vision", "question_text")
+            }
+        )
+        == 1
     )
 
 
@@ -41,7 +47,7 @@ def test_cross_midnight_window_and_role_independent_identity() -> None:
 async def test_two_limits_are_atomic_and_cancel_releases_both() -> None:
     first, second = configured("one"), configured("two")
     limiter = CapacityLimiter(b"fixture-secret")
-    limiter.configure([first, second, configured("one", "vision", limit=1)])
+    limiter.configure([first, second, configured("one", "question_vision", limit=1)])
     active = 0
     peak = 0
     by_model: dict[str, int] = {}

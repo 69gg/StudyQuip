@@ -353,7 +353,7 @@ async def question_extract(ctx: PipelineContext) -> None:
     question = await ctx.bind("question")
     has_reference = bool(question.get("reference_text") or question.get("reference_asset_ids"))
     ids = [*question.get("asset_ids", []), *question.get("reference_asset_ids", [])]
-    profile = await ctx.ai.profile_for("vision" if ids else "chat")
+    profile = await ctx.ai.profile_for("question_vision" if ids else "question_text")
     subjects = await asyncio.to_thread(ctx.db.list, "subject")
     prompt = (
         "识别一道错题。已有非空字段由用户填写，必须尊重；没有把握的字段留空。标准答案只能从用户参考解析资料提取，不能用自行推理的答案填 answer_from_reference。参考图片位于题目图片之后。不得将图片批注误当题干。\n"
@@ -626,7 +626,7 @@ async def question_explain(ctx: PipelineContext) -> None:
     validate_question(question, require_confirmed=True)
     if not question.get("answer_confirmed") or question.get("answer") in (None, "", []):
         raise NeedsReview("请先确认正确答案")
-    profile = await ctx.ai.profile_for("chat")
+    profile = await ctx.ai.profile_for("question_text")
     retrieval = RetrievalService(ctx.db)
     with ctx.db.read() as conn:
         book_ids = retrieval.scoped_books(question.get("book_ids") or None, question.get("subject_id"), conn)
@@ -836,7 +836,7 @@ async def recognize_page(ctx: PipelineContext, page: Json, force: bool = False) 
     if page.get("source_type") == "text":
         result = PageDraft(text=original_text)
     else:
-        profile = await ctx.ai.profile_for("vision")
+        profile = await ctx.ai.profile_for("book_vision")
         prompt = (
             "将这一页教材忠实整理成连续文章，保留标题、正文、例题、侧栏、tips 和补充知识。用明确的‘插图描述’说明可见图像，不补造看不到的信息。多栏按阅读顺序整理，目录条目逐条保留。空白页可以 text 为空且 is_blank=true。只提取本页可见内容，页尾句子未结束是正常跨页；保留原文断句，不添加缺失或截断的判断，不猜补后续内容。本轮只做草稿，跨页续接由后续整理处理。\n可提取的原始文字参考："
             + original_text
@@ -1068,7 +1068,7 @@ async def book_process(ctx: PipelineContext) -> None:
         if page["status"] in {"processed", "skipped"}:
             continue
         await ctx.commit({"phase": "顺序修订教材", "current_page": page.get("index", 0) + 1})
-        await _revise_page(ctx, book, page, await ctx.ai.profile_for("chat"))
+        await _revise_page(ctx, book, page, await ctx.ai.profile_for("book_text"))
 
     def finish(conn: Connection) -> None:
         current = ctx.db.get("book", book["id"], conn=conn) or book
@@ -1097,7 +1097,7 @@ async def page_recognize(ctx: PipelineContext) -> None:
 
 
 async def model_test(ctx: PipelineContext) -> None:
-    profile = await ctx.ai.profile_for("chat", ctx.job["resource_id"])
+    profile = await ctx.ai.profile_for(explicit_id=ctx.job["resource_id"])
     if profile.role == "embedding":
         vectors, usage = await ctx.ai.embed(
             profile,
@@ -1293,7 +1293,7 @@ async def book_index(ctx: PipelineContext) -> None:
     retrieval = RetrievalService(ctx.db)
     await ctx.commit(mutate=lambda conn: retrieval.rebuild(book["id"], conn=conn))
     profiles = await ctx.ai.profiles()
-    chat = next((profile for profile in profiles if profile.role == "chat"), None)
+    chat = next((profile for profile in profiles if profile.role == "book_text"), None)
     embedding = next((profile for profile in profiles if profile.role == "embedding"), None)
     if chat:
         await _summarize_nodes(ctx, book, chat)
@@ -1401,7 +1401,7 @@ async def suggestion_regenerate(ctx: PipelineContext) -> None:
     suggestion = await asyncio.to_thread(ctx.db.get, "suggestion", ctx.job["resource_id"])
     if not suggestion:
         raise ValueError("建议不存在")
-    profile = await ctx.ai.profile_for("chat")
+    profile = await ctx.ai.profile_for("book_text")
     book_id = suggestion["book_id"]
     nodes = await asyncio.to_thread(records, ctx.db, "node", {"book_id": book_id})
     prompt = (
