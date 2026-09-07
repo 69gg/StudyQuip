@@ -99,6 +99,8 @@ HTTP cookie 使用 `HttpOnly`、`SameSite=Lax`，不设置 `Secure`；修改接�
 
 配置由 `STUDYQUIP_` 前缀的环境变量或 `.env` 提供，完整默认值见 `src/studyquip/config.py`。常用项见 [运行与配置](docs/operations.md)。
 
+单文件上传默认上限为 **1 GiB（1024 MB）**，教材与题目附件共用此限制；可通过 `STUDYQUIP_MAX_UPLOAD_MB` 调整。该应用级配置在后端启动时读取，更新代码或 `.env` 不会改变正在运行的后端上限。
+
 默认 `data/` 保存 SQLite 数据库、不可变原件、派生图片与 PDF、应用密钥和持久锁文件。模型凭据保存在应用数据库中；该目录不纳入版本库，备份时与教材一起妥善保存。
 
 更改密码使用 `uv run studyquip password`，旧会话会失效。升级前停止 Web 和 worker，备份完整数据目录，再执行 `uv run studyquip upgrade`。禁止删除锁文件来“解锁”，禁止将数据库放在网络共享目录。

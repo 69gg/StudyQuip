@@ -27,7 +27,7 @@ CI 配置包含 Linux、Windows、macOS 的运行时与后端测试，但配置�
 | LEASE_SECONDS / HEARTBEAT_SECONDS | 90 / 15 | 在途任务租约及续租间隔 |
 | BUSY_TIMEOUT_MS | 5000 | SQLite 锁等待 |
 | WORKER_POLL_SECONDS | 1 | 队列轮询间隔 |
-| MAX_UPLOAD_MB / MAX_PDF_PAGES | 100 / 2000 | 单文件及 PDF 页数限制 |
+| MAX_UPLOAD_MB / MAX_PDF_PAGES | 1024 / 2000 | 单文件上限 1 GiB（1024 MB）及 PDF 页数限制 |
 | MAX_IMAGE_PIXELS | 80000000 | 单图像／渲染像素限制 |
 | OUTPUT_TOKENS | 4096 | 仅在模型上下文预算显式填写且最大输出留空时预留内部容量，不作为 API 输出参数 |
 | PDF_TIMEOUT_SECONDS / PDF_SCALE | 120 / 2 | PDF 准备超时与识别图像渲染比例 |
@@ -41,6 +41,8 @@ CI 配置包含 Linux、Windows、macOS 的运行时与后端测试，但配置�
 | SUMMARY_BATCH_SIZE | 8 | 节点概述批量上限 |
 
 全部变量添加 `STUDYQUIP_` 前缀。模型的窗口、时区、两级并发、输出长度和额外处理预算在 Web UI 配置；同模型桶的冲突并发上限取较小值。
+
+`MAX_UPLOAD_MB` 按每 MB = 1024 × 1024 字节换算，文件大小等于上限时允许上传，超过时拒绝。教材和题目共用上传接口，前端不另设大小上限。此配置在后端启动时读取，现有环境变量或 `.env` 中显式设置的旧值仍会覆盖新默认值；升级时如需 1 GiB，请将其改为 `STUDYQUIP_MAX_UPLOAD_MB=1024`。修改配置不会自动重启后端，也不会即时改变运行中进程的上限。
 
 模型上下文预算留空表示应用不设上下文上限，包括教材材料、正文读取、概述和嵌入分批。旧版 `STUDYQUIP_CONTEXT_TOKENS` 已移除，`.env` 中残留的值会被忽略，不再施加默认 24000 限制。明确填写模型预算时仍按该值控制；服务商自身的限制不变。
 

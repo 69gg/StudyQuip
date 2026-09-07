@@ -326,6 +326,30 @@ def test_model_edits_recheck_windows_and_search_requests_are_reused(database: Da
         assert jobs.get(scheduled["id"])["not_before"] == future
 
 
+def test_upload_size_limit_preserves_boundary_file(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("STUDYQUIP_MAX_UPLOAD_MB", raising=False)
+    assert Settings(_env_file=None).max_upload_mb == 1024
+    # Exercise the real upload boundary at a smaller configured limit to avoid a 1 GiB fixture.
+    monkeypatch.setenv("STUDYQUIP_MAX_UPLOAD_MB", "1")
+    database.settings.max_upload_mb = Settings(_env_file=None).max_upload_mb
+    content = "教材".encode() + b" " * (1024 * 1024 - len("教材".encode()))
+    set_password(database, "test-password-only")
+    with TestClient(create_app(database.settings), base_url="http://127.0.0.1:8765") as client:
+        session = client.post("/api/login", json={"password": "test-password-only"}).json()
+        client.headers.update({"X-CSRF-Token": session["csrf_token"]})
+        accepted = client.post("/api/assets", files={"file": ("textbook.txt", content, "text/plain")})
+        assert accepted.status_code == 200
+        assert client.get(accepted.json()["url"]).content == content
+        saved_files = set(database.settings.files_dir.iterdir())
+        rejected = client.post("/api/assets", files={"file": ("oversized.txt", content + b"!", "text/plain")})
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == "文件超过 1 MB 上限"
+        assert [asset["id"] for asset in database.list("asset")] == [accepted.json()["id"]]
+        assert set(database.settings.files_dir.iterdir()) == saved_files
+
+
 def test_exif_and_heif_crop_preserve_original(database: Database) -> None:
     settings = database.settings
     image = Image.new("RGB", (80, 40), (10, 100, 180))

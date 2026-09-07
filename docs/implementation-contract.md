@@ -6,7 +6,7 @@
 
 包：`studyquip`，源码位于 `src/studyquip`。所有 Python 函数添加类型注释。
 
-`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、output_tokens=4096、max_upload_mb=100、worker_poll_seconds=1、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。应用级 `context_tokens` 已删除，旧 `STUDYQUIP_CONTEXT_TOKENS` 被忽略；上下文仅由各模型的可空配置决定。
+`config.Settings` 为 Pydantic Settings：data_dir(Path)、host、port、allowed_origins(list[str])、lease_seconds=90、heartbeat_seconds=15、busy_timeout_ms=5000、output_tokens=4096、max_upload_mb=1024、worker_poll_seconds=1、frontend_dir(Path)。属性 db_path、files_dir。`Settings()` 读 STUDYQUIP_ 环境变量。上传限制按 MiB 换算，默认 1 GiB；API 的读取边界与媒体层校验共用该值，等于上限允许上传，超过拒绝，运行中实例不热重载此应用级配置。应用级 `context_tokens` 已删除，旧 `STUDYQUIP_CONTEXT_TOKENS` 被忽略；上下文仅由各模型的可空配置决定。
 
 `db.Database(settings)` 持有 rw/ro SQLAlchemy engine。`write()` 是返回 Connection 的短事务 context manager；`read()` 是只读 Connection context manager。`get(kind, id, conn=None)` 返回 dict 或 None；`list(kind, *, filters=None, limit=1000, offset=0, conn=None)` 返回 dict 列表，filters 对 data JSON 顶层字段精确比较。`put(kind, data, *, id=None, expected_revision=None, conn=None)` 返回带 id/revision/created_at/updated_at 的 dict；存在时未提供 expected_revision 视为调用方已在同一写事务锁定，外部修改必须明确传版本。`delete(kind,id,*,conn=None)`。`history(kind,id,conn=None)` 返回旧/现版本列表。`secret()` 返回持久化 bytes。`ConflictError` 表示版本冲突。records 表为(kind,id,revision,data JSON,created_at,updated_at)，history 保存每次版本。
 
