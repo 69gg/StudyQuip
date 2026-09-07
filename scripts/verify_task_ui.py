@@ -34,10 +34,10 @@ async def verify() -> dict[str, Any]:
     question = {
         "id": "question",
         "revision": 1,
-        "stem": "什么是惯性？",
+        "stem": r"已知 $\frac{x^2}{2}=8$，求 x 的取值。另有 1/2x 待核对。",
         "type": "short_answer",
         "subject_id": "subject",
-        "answer": "物体保持原有运动状态的性质",
+        "answer": r"$x=\pm4$",
         "answer_confirmed": True,
         "options": [],
         "asset_ids": [],
@@ -46,6 +46,7 @@ async def verify() -> dict[str, Any]:
         "book_ids": [],
         "notes": "",
         "reference_text": "",
+        "formatting_warnings": ["题干：1/2x 的分母范围不明确，已保留原文。"],
     }
     model = ModelProfile(
         id="model",
@@ -186,6 +187,16 @@ async def verify() -> dict[str, Any]:
             await page.goto("http://studyquip.test/#questions?question=question")
             await expect(page.get_by_role("button", name="题目处理中", exact=True)).to_be_disabled()
             await expect(page.get_by_role("button", name="已有处理任务", exact=True)).to_be_disabled()
+            await expect(page.get_by_text("公式需要核对", exact=True)).to_be_visible()
+            await expect(page.get_by_text(question["formatting_warnings"][0], exact=True)).to_be_visible()
+            await page.get_by_role("button", name="预览", exact=True).click()
+            await expect(page.locator(".question-prompt .katex")).to_be_visible()
+            assert await page.locator(".katex-error").count() == 0
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            await page.screenshot(path=str(output / "question-formulas-mobile-dark.png"), full_page=True)
+            await page.set_viewport_size({"width": 1280, "height": 900})
+            await page.screenshot(path=str(output / "question-formulas-desktop-dark.png"), full_page=True)
+            await page.set_viewport_size({"width": 390, "height": 844})
             await page.goto("http://studyquip.test/#settings")
             await expect(page.get_by_role("button", name="测试已安排", exact=True)).to_be_disabled()
             for label in MODEL_ROLE_LABELS.values():
@@ -258,6 +269,7 @@ async def verify() -> dict[str, Any]:
         "home_shares_task_progress": True,
         "expired_lease_and_api_failure_guarded": True,
         "separate_model_purposes": list(MODEL_ROLE_LABELS),
+        "question_formulas_and_review_notices": True,
         "mobile_overflow": False,
         "browser_errors": errors,
     }

@@ -23,7 +23,7 @@ from studyquip.context import node_source_fingerprint
 from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
 from studyquip.media import store_upload
-from studyquip.pipelines import PipelineContext
+from studyquip.pipelines import PipelineContext, QuestionDraft, question_text_fields
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
@@ -682,6 +682,152 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
             await context.finish({"invalid": True})
     assert db.get("marker", "deleted-write") is None
     db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["text", "image", "ambiguous"])
+async def test_question_formulas_preserve_answers_and_ambiguous_fields(tmp_path: Path, mode: str) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        for role in ("question_text", "question_vision"):
+            db.put(
+                "model",
+                ModelProfile(
+                    role=role, base_url="https://fixture.invalid/v1", api_key="fixture", model=role
+                ).model_dump(),
+            )
+        subject = db.put("subject", {"name": "数学"})
+        image_ids: list[str] = []
+        if mode == "image":
+            buffer = io.BytesIO()
+            Image.new("RGB", (8, 8), "white").save(buffer, "PNG")
+            asset = store_upload(settings, "fixture.png", buffer.getvalue())
+            db.put("asset", asset, id=asset["id"])
+            image_ids.append(asset["id"])
+        original = db.put(
+            "question",
+            {
+                "subject_id": subject["id"],
+                "type": "single_choice",
+                "stem": "" if image_ids else "已知 x^2/2=8，求 x 的取值。另有 1/2x。",
+                "options": [
+                    {"id": "a", "text": "" if image_ids else "sqrt(4)"},
+                    {"id": "b", "text": "" if image_ids else "x^2/2"},
+                ],
+                "answer": None if image_ids else "a",
+                "answer_confirmed": not image_ids,
+                "wrong_answer": "我原来的错误作答",
+                "notes": "保留我的备注",
+                "error_reason": "我忘记检查符号。",
+                "asset_ids": image_ids,
+                "explanation": {"summary": "旧讲解"},
+                "explanation_stale": False,
+            },
+        )
+        issues = (
+            [
+                {"field": "stem", "message": "1/2x 的分母范围不明确。"},
+                {"field": "option", "option_id": "a", "message": "选项符号需要核对。"},
+            ]
+            if mode == "ambiguous"
+            else []
+        )
+        formatted_stem = r"已知 $\frac{x^2}{2}=8$，求 x 的取值。另有 1/2x。"
+        candidate = {
+            "type": "short_answer",  # An existing type and all manual answer fields remain protected.
+            "stem": formatted_stem,
+            "options": [
+                {"id": "b", "text": r"$\frac{x^2}{2}$"},
+                {"id": "a", "text": r"$\sqrt{4}$"},
+                *([{"id": "c", "text": "$4$"}] if image_ids else []),
+            ],
+            "answer_from_reference": "不能擅自填写的答案",
+            "wrong_answer": "不能覆盖用户作答",
+            "formatting_issues": issues,
+        }
+        calls: list[dict[str, Any]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            wire = json.loads(request.content)
+            calls.append(wire)
+            assert wire["model"] == ("question_vision" if image_ids else "question_text")
+            prompt = wire["messages"][1]["content"][0]["text"]
+            assert r"$\frac{x^2}{2}$" in prompt and r"$\ce{H2SO4}$" in prompt
+            assert "不润色叙述" in prompt and "formatting_issues" in prompt
+            return httpx.Response(
+                200,
+                json={
+                    "id": "fixture",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": wire["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "submit",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "submit_result",
+                                            "arguments": json.dumps(candidate),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+
+        jobs = JobStore(db)
+        worker = Worker(settings, db, AIService(db, settings, transport=httpx.MockTransport(respond)))
+        job = jobs.enqueue("question_extract", original["id"])
+        claimed = jobs.claim(worker.owner)
+        assert claimed
+        await worker._dispatch(claimed)
+        assert jobs.get(job["id"])["status"] == "completed", jobs.get(job["id"])["error"]
+        saved = db.get("question", original["id"])
+        assert saved and len(calls) == 1
+        assert saved["stem"] == (original["stem"] if issues else formatted_stem)
+        expected_ids = ["b", "a", "c"] if image_ids else ["a", "b"]
+        assert [option["id"] for option in saved["options"]] == expected_ids
+        if issues:
+            assert saved["options"][0] == original["options"][0]
+            assert saved["options"][1]["text"] == candidate["options"][0]["text"]
+            assert len(saved["formatting_warnings"]) == 2
+        else:
+            assert not saved["formatting_warnings"]
+            assert {option["id"]: option["text"] for option in saved["options"]} == {
+                option["id"]: option["text"] for option in candidate["options"]
+            }
+        for field in ("answer", "type", "wrong_answer", "notes", "error_reason"):
+            assert saved[field] == original[field]
+        assert not saved["answer_confirmed"] and saved["status"] == "draft"
+        assert saved["explanation_stale"] and saved["explanation"] == original["explanation"]
+        assert db.history("question", saved["id"])[0] == original
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_question_formatting_retains_cached_text_and_invalid_option_links(legacy: bool) -> None:
+    original = {"stem": "题目原文", "options": [{"id": "a", "text": "选项原文"}], "answer": "a"}
+    draft = QuestionDraft(
+        type="single_choice",
+        stem="题目候选",
+        options=[{"id": "unknown", "text": "$1$"}],
+        formatting_issues=None if legacy else [],
+    )
+    fields = question_text_fields(original, QuestionDraft.model_validate(draft.model_dump()))
+    assert fields["options"] == original["options"]
+    assert fields["stem"] == (original["stem"] if legacy else draft.stem)
+    assert bool(fields["formatting_warnings"]) is not legacy
 
 
 @pytest.mark.asyncio

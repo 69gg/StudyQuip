@@ -281,6 +281,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         if answer_changed:
             merged.update(answer_confirmed=False, status="draft")
+        if data["stem"] != old.get("stem") or data["options"] != old.get("options"):
+            merged["formatting_warnings"] = []
         return present_question(db.put("question", merged, id=id, expected_revision=body.revision))
 
     @application.delete("/api/questions/{id}")

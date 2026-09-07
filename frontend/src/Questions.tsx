@@ -370,6 +370,7 @@ function QuestionEditor({
     setQ((old) => ({
       ...old,
       [key]: value,
+      ...(["stem", "options"].includes(key) ? { formatting_warnings: [] } : {}),
       ...(old.explanation ? { explanation_stale: true } : {}),
       ...(["answer", "type", "options", "stem"].includes(key)
         ? { answer_confirmed: false }
@@ -459,6 +460,20 @@ function QuestionEditor({
           resourceId={q.id}
           kinds={["question_extract", "question_explain"]}
         />
+      )}
+      <p className="hint">
+        AI
+        整理会规范题干和选项中的公式，保留题意与原数据。完成后可切换预览，检查并重新确认答案。
+      </p>
+      {!!q.formatting_warnings?.length && (
+        <div className="gentle-notice" role="status">
+          <strong>公式需要核对</strong>
+          <ul>
+            {q.formatting_warnings.map((message, index) => (
+              <li key={index}>{message}</li>
+            ))}
+          </ul>
+        </div>
       )}
       {preview ? (
         <QuestionContent question={q} answer explanation knowledge />

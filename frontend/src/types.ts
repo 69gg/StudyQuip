@@ -35,6 +35,7 @@ export type Question = Entity & {
   status?: string;
   explanation?: Record<string, unknown>;
   explanation_stale?: boolean;
+  formatting_warnings?: string[];
 };
 export type Book = Entity & {
   title: string;

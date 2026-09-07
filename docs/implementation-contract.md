@@ -53,6 +53,8 @@ GET/POST /api/subjects；GET/POST /api/questions；GET/PUT/DELETE /api/questions
 
 Question 另有用户自填 `error_reason:string=""` 与 `optimize_error_reason:boolean=false`。旧记录在读取时补默认值，无需数据库架构迁移。优化结果为 `explanation.error_reason_optimized:string|null`；仅在已勾选、有原文且讲解未过期时展示，不覆盖原文。
 
+“AI 整理题目”在 `QuestionDraft.stem/options` 中返回规范公式排版后的完整文本，并返回 `formatting_issues:[{field:stem|option,option_id?:string|null,message:string}]`，无问题为 `[]`；缺省／`null` 兼容旧工具结果，仅补空字段。`question_text_fields(question,draft)` 按现有选项 ID 合并文本，保留顺序，拒绝不完整或重复的候选 ID；有问题的已有字段保留原文，未填写答案且全空的选项占位列表可以重建。应用只读输出 `formatting_warnings?:string[]` 用于核对提示，手动修改题干或选项后清除；内容变化或出现提示后要求重新确认答案。原答案值保持不变，旧讲解过期，历史由既有 `record_history` 保留。无需结构迁移，也不增加独立格式整理任务。
+
 GET/POST /api/books；GET/PUT/DELETE /api/books/{id}，fields title,subject_id,text,asset_ids,revision,status；POST /api/books/{id}/process 同 schedule。GET /api/books/{id}/pages,/nodes,/blocks,/suggestions；PUT /api/books/{id}/pages/{page_id} 手工草稿 {text,revision}；POST /api/books/{id}/pages/{page_id}/recognize,/skip,/text-only；POST /api/books/{id}/operations 提交操作组；POST /api/books/{id}/suggestions/{id}/accept,/ignore,/regenerate；GET /api/books/{id}/blocks/{id}/history。
 
 教材的 `extra_processing_budget` 可为空；有限预算耗尽后增加预算会恢复索引任务。页面 `index` 是整本输入顺序，`page_index` 是原 PDF 内部页号。删除教材会在同一事务取消教材及页面／建议的相关任务，worker 提交时仍复核父教材状态。

@@ -41,6 +41,12 @@ class Option(Structured):
     text: str
 
 
+class QuestionFormattingIssue(Structured):
+    field: Literal["stem", "option"]
+    option_id: str | None = None
+    message: str = Field(min_length=1)
+
+
 class QuestionDraft(Structured):
     subject_id: str | None = None
     type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer"]
@@ -49,6 +55,8 @@ class QuestionDraft(Structured):
     answer_from_reference: str | list[str] | None = None
     wrong_answer: str | None = None
     reference_analysis: str | None = None
+    # Cached results from before formula formatting must not rewrite existing text.
+    formatting_issues: list[QuestionFormattingIssue] | None = None
 
 
 class EvidenceDraft(Structured):
@@ -349,6 +357,50 @@ class PipelineContext:
         return urls
 
 
+def question_text_fields(question: Json, draft: QuestionDraft) -> Json:
+    stem = question.get("stem") or ""
+    options = copy.deepcopy(question.get("options") or [])
+    warnings: list[str] = []
+    issues = draft.formatting_issues or []
+    option_ids = {option["id"] for option in options}
+    for issue in issues:
+        label = "题干"
+        if issue.field == "option":
+            index = next((i for i, option in enumerate(options) if option["id"] == issue.option_id), None)
+            label = f"第 {index + 1} 个选项" if index is not None else "选项"
+        warnings.append(f"{label}：{issue.message}")
+
+    if not stem:
+        stem = draft.stem
+    elif draft.formatting_issues is not None and not any(issue.field == "stem" for issue in issues):
+        if draft.stem.strip():
+            stem = draft.stem
+        else:
+            warnings.append("AI 未返回有效题干，已保留原文。")
+
+    if not options or (not question.get("answer") and not any(option["text"].strip() for option in options)):
+        options = [option.model_dump() for option in draft.options]
+    elif draft.formatting_issues is not None:
+        candidates = {option.id: option.text for option in draft.options}
+        if set(candidates) != option_ids or len(candidates) != len(draft.options):
+            warnings.append("AI 返回的选项 ID 不完整或重复，已保留原选项。")
+        else:
+            for index, option in enumerate(options):
+                blocked = any(
+                    issue.field == "option"
+                    and (issue.option_id == option["id"] or issue.option_id not in option_ids)
+                    for issue in issues
+                )
+                if blocked:
+                    continue
+                text = candidates[option["id"]]
+                if text.strip():
+                    option["text"] = text
+                elif option["text"]:
+                    warnings.append(f"AI 未返回第 {index + 1} 个选项的有效内容，已保留原文。")
+    return {"stem": stem, "options": options, "formatting_warnings": warnings}
+
+
 async def question_extract(ctx: PipelineContext) -> None:
     question = await ctx.bind("question")
     has_reference = bool(question.get("reference_text") or question.get("reference_asset_ids"))
@@ -356,7 +408,9 @@ async def question_extract(ctx: PipelineContext) -> None:
     profile = await ctx.ai.profile_for("question_vision" if ids else "question_text")
     subjects = await asyncio.to_thread(ctx.db.list, "subject")
     prompt = (
-        "识别一道错题。已有非空字段由用户填写，必须尊重；没有把握的字段留空。标准答案只能从用户参考解析资料提取，不能用自行推理的答案填 answer_from_reference。参考图片位于题目图片之后。不得将图片批注误当题干。\n"
+        "识别一道错题，并整理题干和选项的公式排版。已有题干和选项只允许格式规范化，不润色叙述、解题、纠错、补条件或改变数学含义；保留所有数值、变量、单位、正负号、条件及选项 ID。已有选项按原 ID 返回全部选项，不新增、删除或改变顺序；仅当全部选项内容为空且尚无答案时，可按原图重建空白占位选项。其余非空字段由用户填写，必须尊重；没有把握的缺失字段留空。标准答案只能从用户参考解析资料提取，不能用自行推理的答案填 answer_from_reference。参考图片位于题目图片之后。不得将图片批注误当题干。\n"
+        r"在 stem 和 options.text 中使用 Markdown 与 KaTeX 支持的 LaTeX：行内公式用 $...$，独立公式用单独成行的 $$...$$。将含义明确的分数、根号、上下标、向量和化学式规范排版，例如 x^2/2 写为 $\frac{x^2}{2}$，sqrt(x) 写为 $\sqrt{x}$，H2SO4 写为 $\ce{H2SO4}$。化学反应使用 \ce{...}，保留原系数和反应条件，不自行配平。中文叙述放在公式外，不将全文包入公式或代码块；已正确的 LaTeX 不重复包裹。"
+        "\n公式含义不明确（例如未注明分母范围的 1/2x）或图片符号不清时，不猜测：已有字段完整保留原文，空字段忠实转录可辨认内容，并在 formatting_issues 中指出位置与问题（field 为 stem 或 option，选项使用原 option_id）。formatting_issues 必须返回列表，无问题返回 []。\n"
         "做错原因 error_reason 和备注 notes 均由用户填写，题目识别不得生成或改写这两个字段。\n"
         + json.dumps(
             {
@@ -373,8 +427,8 @@ async def question_extract(ctx: PipelineContext) -> None:
     )
 
     def write(conn: Connection) -> None:
-        updated = dict(question)
-        for field in ("stem", "options", "subject_id", "type", "wrong_answer"):
+        updated = {**question, **question_text_fields(question, draft)}
+        for field in ("subject_id", "type", "wrong_answer"):
             value = draft.model_dump()[field]
             if not updated.get(field) and value is not None:
                 updated[field] = value
@@ -391,6 +445,12 @@ async def question_extract(ctx: PipelineContext) -> None:
                 updated["answer_confirmed"] = False
                 updated["answer_source"] = "reference"
         updated["explanation_stale"] = bool(updated.get("explanation"))
+        if (
+            updated["stem"] != question.get("stem", "")
+            or updated["options"] != question.get("options", [])
+            or updated["formatting_warnings"]
+        ):
+            updated.update(answer_confirmed=False, status="draft")
         ctx.db.put("question", updated, id=question["id"], expected_revision=question["revision"], conn=conn)
 
     await ctx.finish({"question_id": question["id"], "requires_answer_confirmation": True}, write)

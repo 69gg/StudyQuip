@@ -1,12 +1,13 @@
 # v0.1 实施与验收记录
 
-更新日期：2026-09-07。实现与自动验证在 Linux x86_64 本机完成。最初使用无外部模型的隔离夹具验收；随后在用户授权的本地配置上完成 DeepSeek 两款模型的简短连接与工具提交测试，那次连接测试未发送真实教材或题目。模型用途拆分仅使用临时数据库、模拟 HTTP transport 与独立浏览器响应夹具。最新的上传上限调整仅使用临时数据库与 TestClient 验证，未启动或重启运行中的后端。
+更新日期：2026-09-07。实现与自动验证在 Linux x86_64 本机完成。最初使用无外部模型的隔离夹具验收；随后在用户授权的本地配置上完成 DeepSeek 两款模型的简短连接与工具提交测试，那次连接测试未发送真实教材或题目。模型用途拆分与最新的题目公式整理使用临时数据库、模拟 HTTP transport 与独立浏览器响应夹具；未访问真实业务数据库，未启动或重启 Web／worker，未调用真实模型。
 
 ## 已实现的功能范围
 
 - 单用户密码登录、会话／CSRF、显式局域网来源、桌面与移动布局；外观为图标三段式单选，支持浅色／深色／系统主题、键盘切换和本地偏好保存。
 - 首页的真实最近错题、教材与待处理任务，按配置显示的开始步骤，录入／导入和已有记录深链接；原创品牌 SVG、统一导航图标及独立琥珀色教材提示。
 - 四种题型的草稿录入、参考解析图片／文本、人工确认答案、输入变更后讲解过期、教材范围和有出处的结构化讲解。
+- 题干与选项在同一次 AI 整理请求中规范公式排版；兼容已有文本与图片输入，有歧义的已有字段保留原文并显示核对提示，原选项 ID、顺序、用户答案及历史受保护。
 - 教材文本／文件／图片／PDF 导入，EXIF 归正、HEIF 转换和裁剪；任意目录树、顺序修订、可选上下文预算、人工保护、页面手工校正／重新识别／跳过、建议差异审阅、版本恢复。已去除自动质量分级与补救调用，旧待校对页在启动时转为草稿。
 - 单文件默认上传上限为 1 GiB（1024 MB），环境变量可覆盖；后端启动时读取，等于上限允许上传，超限拒绝。
 - 一次性操作组回执、块合并／拆分、当前重定向与证据投影、规范化引文坐标、概念证据硬校验。
@@ -21,14 +22,14 @@
 | 检查 | 本机结果 | 能证明的范围 |
 |---|---|---|
 | `uv run studyquip doctor` | CPython 3.13.15，SQLite 3.53.1，sqlite-vec 0.1.9；FTS5、距离计算、共享锁后端通过 | 当前 `.venv` 的真实链接运行时 |
-| `uv run pytest -q` | 55 个参数化用例通过 | 下述四组后端关键协议与状态行为，包含可选预算、最新配置续接、旧待校对页恢复、模型用途拆分与调用路由 |
-| `uv run pytest -q tests/test_runtime_api.py -k 'upload_size_limit or exif_and_heif'` | 2 个用例通过 | 上传上限调整后的边界与原件保存；未重新运行完整后端套件 |
+| `uv run pytest -q` | 61 个参数化用例通过 | 下述四组后端关键协议与状态行为，包含可选预算、最新配置续接、旧待校对页恢复、模型用途拆分、上传边界与题目公式整理 |
+| `uv run pytest -q tests/test_runtime_api.py -k 'upload_size_limit or exif_and_heif'` | 2 个用例通过 | 上传上限调整后的边界与原件保存；也已纳入本次完整后端验证 |
 | `uv run ruff check src tests scripts` | 通过 | Python 基础静态检查 |
 | 前端 TypeScript／Vite 构建 | 通过 | 类型与生产构建；不能替代视觉验收 |
 | `pnpm --dir frontend test` | 8 个用例通过 | 练习版内容隔离、配图、错因原文保护及优化结果显示条件；首页排序、任务优先级与真实状态判断 |
 | `scripts/evaluate_retrieval.py` | 已实际运行，结果见 retrieval-evaluation.md | 小型合成数据上的通道组合行为 |
 | `scripts/verify_local.py` | 已实际运行 | 独立数据库、真实 Web 与 worker、Chromium、PDFium 与文件结果 |
-| `scripts/verify_task_ui.py` | 已实际运行；浏览器异常 0，移动端无横向溢出 | 本地前端构建＋真实 Chromium＋路由夹具，刷新与防重复状态；不启动 Web／worker |
+| `scripts/verify_task_ui.py` | 已实际运行；浏览器异常 0，移动端无横向溢出 | 本地前端构建＋真实 Chromium＋路由夹具，刷新与防重复状态、公式预览与核对提示；不启动 Web／worker |
 
 上传上限验证确认默认 1024 MB，并用环境变量将隔离测试上限缩小为 1 MB：通过真实上传接口接受恰好等于上限的 UTF-8 文件并逐字节下载核对，超出 1 字节时返回 422，且不新增原件或数据库记录。未分配或上传真实 1 GiB 文件，未进行真实浏览器的大文件传输验收；当前运行进程仍使用启动时的配置。
 
@@ -44,6 +45,8 @@
 4. **检索与证据**：Unicode 与码点、空白、重复引文、标点／OCR 差异拒绝、别名与转义、跨教材隔离、多维向量、双向关系数量上限、当前证据失效。
 
 真实 SQLite 的串联流程覆盖教材页草稿→正式块／概念／FTS→概述／嵌入→错题提取→用户确认→引用讲解，同时使用上下文预算留空的讲解和嵌入模型配置检查教材修订、概述与嵌入分批正常完成。模型返回值使用可复现夹具；这不证明真实模型的内容质量。
+
+题目公式整理新增五个参数化场景：已有文本、图片及空白占位选项、有歧义的题干／选项、旧缓存结果、不完整候选 ID。前三种经过实际 worker 分发、SDK 与临时 SQLite，验证每次仅一次模型请求、分别选择题目文本／图片模型、按原 ID 保留选项顺序、受影响字段保留原文、原答案／作答／备注／错因不被覆盖、撤销答案确认及保留历史。旧缓存经序列化恢复后仍只补空字段；候选 ID 不完整时保留原选项并提示。这些夹具证明结果接收与状态行为，不证明真实模型能始终保持题意或正确转换公式。
 
 中断续接使用两种参数化夹具（旧检查点、新输入快照），在临时 SQLite 中准备已完成页、已识别页和跳过页，模拟第二页工具返回后的中断，再经 TestClient 调用续接接口。验证预约时间生效、重复点击不改期、原任务保留、已完成页／块不变，继续后完成正文处理；来源修改或删除不能复用旧结果。旧检查点配置不变时保留完整思考／工具结果；新检查点场景把保存的旧材料总预算设为 512 并修改模型和 effort，验证旧预算不再拦截、实际 HTTP 请求采用最新模型和参数，未混入旧工具链。长书样本验证设置变化后固定单元边界不移动。SDK 夹具检查图片请求及指纹保存，不重复保存 Base64。这些检查仅用临时库、TestClient 和 HTTP transport，没有连接现有业务数据库、启动应用服务或调用真实模型。
 
@@ -61,7 +64,9 @@
 
 ## 用户流程与视觉验收
 
-本次进度与热重载修改遵循“不启动应用进程”的要求：没有运行 Web／worker，也未调用真实服务商。后端使用临时 SQLite 和 TestClient；前端使用 `scripts/verify_task_ui.py` 读取本地构建，由 Playwright 路由提供响应夹具。最新报告位于本机 `.verification/task-ui-1788702707352165809/report.json`，记录 `app_processes_started=false`、`external_model_requests=0`、`search_restored_after_reload=true`、`unsaved_page_edits_preserved=true`、`home_shares_task_progress=true`、`expired_lease_and_api_failure_guarded=true`；书本、原页、题目、模型测试、导出和检索入口均验证了未结束任务保护。实际检查 1280px 桌面与 390px 深色移动截图，无横向溢出及浏览器错误。该验证不等于已把新代码放入运行中的应用验收。
+本次公式整理使用 `scripts/verify_task_ui.py` 读取本地构建，由 Playwright 路由提供响应夹具。报告位于 `.verification/task-ui-1788793605506699659/report.json`，记录 `question_formulas_and_review_notices=true`、`app_processes_started=false`、`external_model_requests=0`、`browser_errors=[]`。已查看 `question-formulas-mobile-dark.png` 与 `question-formulas-desktop-dark.png`：分数正常渲染，编辑与预览旁均显示核对提示，移动端无横向溢出；其他任务入口的刷新保护继续通过。未重新生成 PDF，也未把新代码装入运行中的 worker；新提示词在用户下次启动新版 worker 后生效。
+
+此前进度与热重载修改遵循“不启动应用进程”的要求：没有运行 Web／worker，也未调用真实服务商。后端使用临时 SQLite 和 TestClient；前端使用 `scripts/verify_task_ui.py` 读取本地构建，由 Playwright 路由提供响应夹具。当时报告位于本机 `.verification/task-ui-1788702707352165809/report.json`，记录 `app_processes_started=false`、`external_model_requests=0`、`search_restored_after_reload=true`、`unsaved_page_edits_preserved=true`、`home_shares_task_progress=true`、`expired_lease_and_api_failure_guarded=true`；书本、原页、题目、模型测试、导出和检索入口均验证了未结束任务保护。实际检查 1280px 桌面与 390px 深色移动截图，无横向溢出及浏览器错误。该验证不等于已把新代码放入运行中的应用验收。
 
 `scripts/verify_local.py` 创建独立 `.verification/run-*/`，实际启动服务并登录，生成练习／复习 PDF，下载后重新打开并检查 A4 尺寸、中文可提取文字、答案显示隔离和配图。导出的 PDF 再通过隔离 PDFium 进程导入，验证逐页正文与预览图生成。
 
