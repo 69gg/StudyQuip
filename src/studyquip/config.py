@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = Field(default_factory=list)
     lease_seconds: int = Field(90, ge=3)
     heartbeat_seconds: float = Field(15, gt=0)
+    stream_progress_interval_seconds: float = Field(1, gt=0)
+    default_subjects: list[str] = Field(default_factory=lambda: ["生物", "化学", "物理", "英语", "数学"])
     busy_timeout_ms: int = Field(5000, ge=1)
     output_tokens: int = Field(4096, ge=128)
     max_upload_mb: int = Field(1024, ge=1)

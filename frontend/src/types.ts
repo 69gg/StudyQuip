@@ -14,7 +14,35 @@ export type Asset = Entity & {
   height?: number;
 };
 export type QuestionType =
-  "single_choice" | "multiple_choice" | "fill_blank" | "short_answer";
+  | "single_choice"
+  | "multiple_choice"
+  | "fill_blank"
+  | "short_answer"
+  | "composite";
+export type PlotSpec = {
+  x_min: number;
+  x_max: number;
+  y_min: number;
+  y_max: number;
+  x_label: string;
+  y_label: string;
+  series: { label: string; expression: string; points: [number, number][] }[];
+};
+export type RenderedFigure = {
+  id: string;
+  kind: "svg" | "plot";
+  title: string;
+  svg?: string | null;
+  plot?: PlotSpec | null;
+};
+export type Material = {
+  id: string;
+  kind: "text" | "listening";
+  title: string;
+  text: string;
+  audio_asset_id?: string | null;
+  audio_generated_from?: string | null;
+};
 export type Question = Entity & {
   subject_id: string;
   type: QuestionType;
@@ -32,6 +60,11 @@ export type Question = Entity & {
   figure_asset_ids: string[];
   figures?: { id: string; url: string; name?: string }[];
   book_ids: string[];
+  parts?: Question[];
+  materials?: Material[];
+  audio_pending_roles?: Model["role"][];
+  rendered_figures?: RenderedFigure[];
+  figure_requirements?: string[];
   status?: string;
   explanation?: Record<string, unknown>;
   explanation_stale?: boolean;
@@ -107,6 +140,14 @@ export type RequestActivity = {
   format_attempt?: number;
   format_limit?: number;
   reason?: string;
+  streaming?: boolean;
+  received_events?: number;
+  first_received_at?: number;
+  last_received_at?: number;
+  output_characters?: number;
+  reasoning_characters?: number;
+  tool_argument_characters?: number;
+  tool_names?: string[];
 };
 export type Model = Entity & {
   name: string;
@@ -115,13 +156,20 @@ export type Model = Entity & {
     | "book_text"
     | "question_vision"
     | "question_text"
-    | "embedding";
+    | "embedding"
+    | "speech_recognition"
+    | "speech_synthesis";
   protocol: "chat" | "responses";
   base_url: string;
   api_key?: string;
   has_api_key?: boolean;
   model: string;
   thinking: "omit" | "enabled" | "disabled";
+  stream?: boolean;
+  stream_include_usage?: boolean;
+  voice?: string;
+  audio_language?: string | null;
+  audio_speed?: number | null;
   tool_choice?: "required" | "auto" | "omit";
   reasoning_effort?: string | null;
   temperature?: number | null;
@@ -171,6 +219,7 @@ export const questionTypes: Record<QuestionType, string> = {
   multiple_choice: "多选题",
   fill_blank: "填空题",
   short_answer: "简答题",
+  composite: "大题",
 };
 export const roleLabels: Record<Model["role"], string> = {
   book_vision: "教材图片模型",
@@ -178,6 +227,8 @@ export const roleLabels: Record<Model["role"], string> = {
   question_vision: "题目图片模型",
   question_text: "题目文本模型",
   embedding: "向量嵌入模型",
+  speech_recognition: "语音识别模型",
+  speech_synthesis: "语音合成模型",
 };
 export const roleDescriptions: Record<Model["role"], string> = {
   book_vision: "识别教材图片与 PDF 页面，提取文字和插图描述。",
@@ -185,11 +236,14 @@ export const roleDescriptions: Record<Model["role"], string> = {
   question_vision: "识别题目图片和参考解析图片，提取题目字段。",
   question_text: "整理纯文本题目，生成讲解、知识点与已勾选的错因优化。",
   embedding: "生成教材与查询文本的向量，供语义检索使用。",
+  speech_recognition: "将听力录音转为文稿，使用兼容的音频识别接口。",
+  speech_synthesis: "将听力文稿合成为录音，可配置服务商提供的音色。",
 };
 export const jobKindLabels: Record<string, string> = {
   model_test: "模型连接测试",
   question_extract: "整理题目",
   question_explain: "生成讲解",
+  question_audio: "补全听力资料",
   book_process: "整理教材",
   page_recognize: "识别教材页",
   book_index: "建立教材索引",
@@ -224,4 +278,23 @@ export function answerText(value: unknown): string {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(answerText).join("、");
   return JSON.stringify(value);
+}
+
+export function questionNodes(question: Question): Question[] {
+  const result: Question[] = [],
+    stack = [question];
+  while (stack.length) {
+    const node = stack.pop()!;
+    result.push(node);
+    stack.push(...[...(node.parts || [])].reverse());
+  }
+  return result;
+}
+export function questionTitle(question: Question): string {
+  return (
+    question.stem ||
+    question.materials?.find((material) => material.title)?.title ||
+    questionNodes(question).find((node) => node.stem)?.stem ||
+    (question.type === "composite" ? "大题" : "待整理的题目")
+  );
 }

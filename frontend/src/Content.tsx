@@ -2,6 +2,7 @@ import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/contrib/mhchem";
+import { RenderFigure } from "./Figures";
 import { answerText, assetUrl, type Question } from "./types";
 export function MathText({
   text,
@@ -170,6 +171,9 @@ export function QuestionContent({
   explanation = false,
   knowledge = false,
   blankLines = 0,
+  practice = false,
+  printing = false,
+  number,
 }: {
   question: Question;
   index?: number;
@@ -177,13 +181,18 @@ export function QuestionContent({
   explanation?: boolean;
   knowledge?: boolean;
   blankLines?: number;
+  practice?: boolean;
+  printing?: boolean;
+  number?: string;
 }) {
+  const label = number ?? (index !== undefined ? String(index + 1) : undefined);
+  const composite = question.type === "composite";
   return (
-    <article className="question-content">
+    <article
+      className={`question-content ${composite ? "composite-question" : "leaf-question"}`}
+    >
       <div className="question-prompt">
-        {index !== undefined && (
-          <div className="question-number">{index + 1}.</div>
-        )}
+        {label && <div className="question-number">{label}.</div>}
         <MathText text={question.stem} />
         {(
           question.figures ||
@@ -200,7 +209,32 @@ export function QuestionContent({
             alt={figure.name || "题目配图"}
           />
         ))}
-        {question.options?.length > 0 && (
+        {question.rendered_figures?.map((figure) => (
+          <RenderFigure key={figure.id} figure={figure} />
+        ))}
+        {question.materials?.map((material) => (
+          <section className="question-material" key={material.id}>
+            {material.title && <h4>{material.title}</h4>}
+            {material.kind !== "listening" || !practice ? (
+              <>
+                {material.kind === "listening" &&
+                  !printing &&
+                  material.audio_asset_id && (
+                    <audio
+                      controls
+                      preload="none"
+                      src={assetUrl(material.audio_asset_id, false)}
+                    />
+                  )}
+                {material.audio_generated_from && !printing && (
+                  <small className="hint">AI 合成音频</small>
+                )}
+                {material.text && <MathText text={material.text} />}
+              </>
+            ) : null}
+          </section>
+        ))}
+        {!composite && question.options?.length > 0 && (
           <div className="options-preview">
             {question.options.map((option, i) => (
               <div key={option.id}>
@@ -210,7 +244,7 @@ export function QuestionContent({
             ))}
           </div>
         )}
-        {blankLines > 0 && (
+        {blankLines > 0 && question.type === "short_answer" && (
           <div className="answer-lines">
             {Array.from({ length: blankLines }, (_, i) => (
               <div key={i} />
@@ -218,10 +252,37 @@ export function QuestionContent({
           </div>
         )}
       </div>
-      {answer && (
+      {question.parts?.map((part, i) => (
+        <QuestionContent
+          key={part.id}
+          question={part}
+          number={label ? `${label}.${i + 1}` : String(i + 1)}
+          answer={answer}
+          explanation={explanation}
+          knowledge={knowledge}
+          blankLines={blankLines}
+          practice={practice}
+          printing={printing}
+        />
+      ))}
+      {answer && !composite && (
         <section className="answer-section">
           <h4>正确答案</h4>
           <MathText text={formatAnswer(question)} />
+        </section>
+      )}
+      {!practice && explanation && !!question.wrong_answer && (
+        <section className="answer-section">
+          <h4>原错误作答</h4>
+          <MathText
+            text={formatAnswer({ ...question, answer: question.wrong_answer })}
+          />
+        </section>
+      )}
+      {!practice && explanation && question.error_reason?.trim() && (
+        <section className="answer-section">
+          <h4>做错原因（原文）</h4>
+          <MathText text={question.error_reason} />
         </section>
       )}
       {explanation && (

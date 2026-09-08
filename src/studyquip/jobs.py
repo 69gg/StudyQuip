@@ -18,7 +18,7 @@ Mutation = Callable[[Connection], Any]
 ACTIVE_STATUSES = ("queued", "running", "waiting_window", "waiting_review")
 JOB_FAMILIES = (
     ("book_process", "book_index"),
-    ("question_extract", "question_explain"),
+    ("question_extract", "question_explain", "question_audio"),
 )
 JOB_RESOURCE_KINDS = {
     "book_process": "book",
@@ -27,6 +27,7 @@ JOB_RESOURCE_KINDS = {
     "suggestion_regenerate": "suggestion",
     "question_extract": "question",
     "question_explain": "question",
+    "question_audio": "question",
     "model_test": "model",
     "search": "search",
     "export_pdf": "export",

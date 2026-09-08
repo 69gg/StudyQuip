@@ -72,6 +72,11 @@ export default function Print({ id }: { id: string }) {
               }),
           ),
         );
+        if (document.querySelector("[data-figure-error]"))
+          throw new Error("部分题目插图无法渲染，请检查绘图配置。");
+        await Promise.all(
+          Array.from(document.images).map((image) => image.decode()),
+        );
         if (document.querySelector(".katex-error"))
           throw new Error("部分公式无法渲染，请检查题目或解析中的公式。");
         await new Promise<void>((resolve) =>
@@ -99,11 +104,13 @@ export default function Print({ id }: { id: string }) {
     );
   if (!snapshot) return <main>正在准备导出内容…</main>;
   return (
-    <main className="print-document">
-      <header className="print-heading">
-        <strong>StudyQuip</strong>
-        <span>{snapshot.mode === "practice" ? "错题练习" : "错题复习"}</span>
-      </header>
+    <main className={`print-document print-${snapshot.mode}`}>
+      {snapshot.mode === "review" && (
+        <header className="print-heading">
+          <strong>StudyQuip</strong>
+          <span>错题复习</span>
+        </header>
+      )}
       {snapshot.questions.map((question, index) => (
         <QuestionContent
           key={question.id}

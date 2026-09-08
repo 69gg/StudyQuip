@@ -20,7 +20,9 @@ from .db import ConflictError, Database, runtime_lock
 from .export import check_export_token, create_snapshot, explanation_stale, export_file, public_snapshot
 from .jobs import JobStore
 from .media import crop_asset, safe_path, store_upload
+from .question_tree import answer_input, audio_work, merge_question_input, walk_questions
 from .schemas import BookInput, ExportInput, QuestionInput, ScheduleInput, SearchInput, validate_question
+from .subjects import ensure_default_subjects, save_subject
 
 
 class LoginInput(BaseModel):
@@ -29,6 +31,7 @@ class LoginInput(BaseModel):
 
 class SubjectInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+    revision: int | None = None
 
 
 class RevisionInput(BaseModel):
@@ -48,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             with runtime_lock(config):
                 await asyncio.to_thread(split_legacy_model_roles, db)
+                await asyncio.to_thread(ensure_default_subjects, db, config.default_subjects)
                 application.state.db = db
                 yield
         finally:
@@ -146,6 +150,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "optimize_error_reason": False,
             **question,
             "explanation_stale": explanation_stale(db, question),
+            "parts": [present_question(part) for part in question.get("parts", [])],
+            "audio_pending_roles": list(dict.fromkeys(role for _, _, role in audio_work(question))),
             "figures": [
                 {
                     "id": id,
@@ -159,11 +165,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def validate_links(data: dict[str, Any], *, images_only: bool = False) -> None:
         if data.get("subject_id"):
             require("subject", data["subject_id"])
-        for key in ("asset_ids", "reference_asset_ids", "figure_asset_ids"):
-            for asset_id in data.get(key, []):
-                asset = require("asset", asset_id)
-                if images_only and not asset["mime"].startswith("image/"):
-                    raise ValueError("题目、参考解析和配图附件仅支持图片")
+        for node in walk_questions(data):
+            for key in ("asset_ids", "reference_asset_ids", "figure_asset_ids"):
+                for asset_id in node.get(key, []):
+                    asset = require("asset", asset_id)
+                    if images_only and not asset["mime"].startswith("image/"):
+                        raise ValueError("题目、参考解析和配图附件仅支持图片")
+            for material in node.get("materials", []):
+                if material.get("audio_asset_id") and not require("asset", material["audio_asset_id"])[
+                    "mime"
+                ].startswith("audio/"):
+                    raise ValueError("听力附件需要音频文件")
         for book_id in data.get("book_ids", []):
             book = require("book", book_id)
             if book.get("subject_id") != data.get("subject_id"):
@@ -221,11 +233,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/subjects")
     def add_subject(body: SubjectInput) -> dict[str, Any]:
-        name = body.name.strip()
-        if not name:
-            raise ValueError("科目名称不能为空")
-        existing = db.list("subject", filters={"name": name})
-        return existing[0] if existing else db.put("subject", {"name": name})
+        return save_subject(db, body.name)
+
+    @application.put("/api/subjects/{id}")
+    def rename_subject(id: str, body: SubjectInput) -> dict[str, Any]:
+        require("subject", id)
+        if body.revision is None:
+            raise ValueError("重命名需要科目版本")
+        return save_subject(db, body.name, id, body.revision)
 
     @application.get("/api/questions")
     def questions(subject_id: str | None = None) -> list[dict[str, Any]]:
@@ -234,7 +249,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/questions")
     def add_question(body: QuestionInput) -> dict[str, Any]:
-        data = body.model_dump(exclude={"revision"})
+        data = body.model_dump(exclude={"revision", "id"})
         validate_links(data, images_only=True)
         return present_question(
             db.put(
@@ -258,26 +273,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         old = {"error_reason": "", "optimize_error_reason": False, **require("question", id)}
         if body.revision is None:
             raise ValueError("保存时需要内容版本")
-        data = body.model_dump(exclude={"revision"})
+        data = body.model_dump(exclude={"revision", "id"})
         validate_links(data, images_only=True)
-        changed = any(data[key] != old.get(key) for key in data)
-        answer_changed = any(
-            data[key] != old.get(key)
-            for key in (
-                "type",
-                "stem",
-                "options",
-                "answer",
-                "asset_ids",
-                "reference_text",
-                "reference_asset_ids",
-            )
-        )
+        previous_input = QuestionInput.model_validate(old).model_dump(exclude={"revision", "id"})
+        changed = data != previous_input
+        answer_changed = answer_input(data) != answer_input(previous_input)
         merged = {
-            **old,
-            **data,
+            **merge_question_input(old, data),
             "explanation_stale": old.get("explanation_stale", False)
-            or (changed and bool(old.get("explanation"))),
+            or (changed and any(node.get("explanation") for node in walk_questions(old))),
         }
         if answer_changed:
             merged.update(answer_confirmed=False, status="draft")
@@ -317,6 +321,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         question = require("question", id)
         validate_question(question)
         return enqueue("question_explain", id, body)
+
+    @application.post("/api/questions/{id}/audio")
+    def complete_question_audio(
+        id: str, body: ScheduleInput = Body(default=ScheduleInput())
+    ) -> dict[str, Any]:
+        require("question", id)
+        return enqueue("question_audio", id, body)
 
     @application.get("/api/books")
     def books() -> list[dict[str, Any]]:
@@ -523,7 +534,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limiter = CapacityLimiter(db.secret())
         limiter.configure(ModelProfile.model_validate(other) for other in db.list("model"))
         model_cap, credential_cap = limiter.effective(profile)
-        clean = {key: value for key, value in model.items() if key != "api_key"}
+        clean = {**model, **profile.model_dump(mode="json", exclude={"api_key"})}
+        clean.pop("api_key", None)
         clean.update(
             has_api_key=bool(model.get("api_key")),
             effective_max_concurrency=model_cap,

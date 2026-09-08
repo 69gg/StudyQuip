@@ -4,7 +4,7 @@
 
 ## 模型协议
 
-`ModelProfile.role` 区分 `book_vision`、`book_text`、`question_vision`、`question_text`、`embedding`，默认 `question_text`。前四种生成用途均可选择 `chat` 或 `responses` 协议；`chat` 在协议字段里仍表示 Chat Completions，不再表示模型用途。角色不参与并发桶身份。未设置的采样／effort 参数不发送。`thinking` 为三态：`omit` 完全省略，另两态作为服务商扩展显式发送。
+`ModelProfile.role` 区分 `book_vision`、`book_text`、`question_vision`、`question_text`、`embedding`、`speech_recognition`、`speech_synthesis`，默认 `question_text`。前四种生成用途均可选择 `chat` 或 `responses` 协议；`chat` 在协议字段里仍表示 Chat Completions，不再表示模型用途。角色不参与并发桶身份。未设置的采样／effort 参数不发送。`thinking` 为三态：`omit` 完全省略，另两态作为服务商扩展显式发送。
 
 | 调用位置 | 模型用途 |
 |---|---|
@@ -123,7 +123,7 @@ worker 启动且尚未认领任务时，`JobStore.restore_review_pages()` 扫描
 
 ## 题目和证据
 
-题目提取在同一次结构化调用中整理题干与选项的公式，既处理图片识别，也处理已有非空题干。提示词要求只规范排版，不润色叙述、纠正题目、补条件或改变数值、变量、正负号、单位与数学含义；行内 `$...$`、独立 `$$...$$`，化学式使用 KaTeX mhchem 的 `\ce{...}`，不自行配平。其余非空字段保持原值，备注和错因原文不可改写。此语义约束由模型执行，应用不声称能够自动证明改写等价。
+题目提取在同一次结构化调用中整理题干与选项的公式，既处理图片识别，也处理已有非空题干。提示词允许在保留原意的前提下润色题干及选项，但不纠正题目、补条件或改变数值、变量、正负号、单位与数学含义；行内 `$...$`、独立 `$$...$$`，化学式使用 KaTeX mhchem 的 `\ce{...}`，不自行配平。其余非空字段保持原值，备注和错因原文不可改写。此语义约束由模型执行，应用不声称能够自动证明改写等价。
 
 `QuestionDraft.formatting_issues` 为问题列表，元素包含 `field(stem|option)`、可选 `option_id` 和 `message`，无问题必须返回 `[]`。标记有问题的已有题干或对应选项完整保留；未知或缺失的选项定位保留所有已有选项。模型返回的选项 ID 集合不完整或重复时保留原选项，并记录核对提示；有效结果按原 ID 合并，原顺序及答案对应关系不变。只有全部选项为空且尚无答案的占位列表可按原图重建。空原字段仍可保存忠实识别的草稿并展示提示，不将任务置为质量等待或追加模型请求。
 
@@ -144,3 +144,22 @@ worker 启动且尚未认领任务时，`JobStore.restore_review_pages()` 扫描
 热重载样本在双协议工具链中修改配置，验证当前链保持原配置、恢复未完成单元时不混用协议、完成结果不会重发；真实临时库另验证等待并发时提高上限、修改窗口不提前预约，以及嵌入模型／维度切换后按新空间恢复。重复请求、刷新后的进度投影和旧租约提交保护共用跨进程任务样本，不为普通 CRUD 增设覆盖率目标。
 
 用途拆分使用 Web 先启动／worker 先启动两种临时库样本，覆盖同时检测、全字段复制、嵌入不变、重复启动及独立修改／删除；API 返回不含凭据。原续接样本加入旧 `chat` 配置升级，完整工具历史仍复用。串联流程对教材修订、概述、纯文本题目、参考图提取和讲解检查实际发送的不同模型 ID，并行教材图片样本使用专属图片模型；四种用途共享模型桶的规则复用并发测试。
+
+
+## 流式与音频协议
+
+`ModelProfile.stream=true` 为 Chat／Responses 的缺省值；老配置无该字段也按开启解释，不需要批量修改旧记录。`stream_include_usage=true` 控制 Chat 的 `stream_options.include_usage`；关闭时整个 `stream_options` 省略。两个设置按下一次请求热读取，不影响已有工具链的模型绑定指纹。关闭流式保留原普通响应路径。嵌入与两个音频接口使用各自协议，不混入生成模型的 `thinking`、effort 或 Chat SSE 参数。
+
+`streaming.py` 使用锁定 OpenAI SDK 的 Chat delta 累积器，保留供应商推理字段与工具参数；Responses 使用 completed／incomplete 事件的完整 response，包含 encrypted reasoning、call_id 与所有输出项，后续按原有 store 模式续接。未收到终态／Chat finish_reason 的断流按网络错误重试。只在完整响应后校验与接受业务结果，不能提交半段 JSON。`StreamProgress` 默认每秒至多持久化一次观测，首事件与结束事件刷新；包含事件数、首末接收时间及三类字符计数，不保存 delta 内容到前端投影。字符数不是 token 数，使用量以服务商完整 usage 为准；断流产生的费用可能没有 usage 回报。
+
+音频用途分别调用 `audio.transcriptions.create`（multipart file、model、JSON response_format、可选 language）与 `audio.speech.create`（model、input、voice、MP3 response_format、可选 speed）。`voice` 无隐含服务商音色，合成模型必须显式设置；扩展 JSON 不能覆盖专用输入字段。SDK 自动重试关闭，共用 worker、窗口、两级并发、网络重试和在途续租。服务商自己的音频长度／上传限制仍适用；不会偷偷换模型或生成空音频假装成功。
+
+`question_audio` 与题目整理／讲解互斥，逐材料存 `audio_results[material_id]` 检查点。ASR 文稿或 TTS 附件发布受租约检查保护；所有缺失项完成或剩余项缺少配置后，整体写入题目新版本。中途失败时，已有阶段在检查点中保留，下次继续跳过，剩余项读取最新配置；题目已被用户修改则拒绝旧任务提交。TTS 保存来源文稿 SHA-256，改文稿后可识别合成音频过期，不替换用户上传的原录音。没有音频模型时保留材料，结果返回缺少的用途。连接测试用短合成文本／一秒静音 WAV，仅验证音频接口，不代表识别质量通过。
+
+## 大题、配图与检索 Agent
+
+`QuestionDraft.parts` 递归使用同一工具结构，已有子题要求完整相同 ID 集合，按原顺序合并；缺失／重复 ID 保留原子树并提示。标准答案、用户原作答、备注、错因与已上传材料不可被模型覆盖。没有已有子题的大题可生成新的基础题或大题节点；新节点、材料和插图 ID 由应用分配，不信任模型重复使用的临时 ID。`formatting_issues` 仍执行原有歧义保护，AI 润色不保证语义等价，用户预览并确认答案是最终录入门槛。
+
+多层题图附带位置、节点 ID 和用途清单，区分原题、配图与参考答案图。题目整理和讲解均获服务端限定范围的 `retrieval_tools`：书本、目录、正文、相邻块、概念、关键词／短语／向量／混合检索。教材空选时使用同科目全部教材，不要求用户先手工选书；提取阶段不因需要检索而擅自改条件或填入推导答案。讲解按基础叶节点独立运行，携带完整祖先材料、题干、备注和参考文字，独立节点可并行；单元按 ID 缓存结果，全部验证后提交整题。勾选错因优化的大题自身也可生成一份说明。
+
+配图字段包括 `rendered_figures`（SVG 或 plot）、`figure_description`（提供给文本模型的忠实图示说明）和 `figure_requirements`（需人工补图的原因）。SVG 仅静态图形与文字，经服务端 defusedxml 白名单验证，前端 DOMPurify 过滤后用隔离图片渲染；禁止脚本、外链图片及交互。plot 支持坐标范围、函数或点列，前端使用 mathjs 数学 AST 白名单，不执行任意代码。旧上传图片单独保留，不丢弃；生成插图不能证明已准确复刻原题，需要预览核对。

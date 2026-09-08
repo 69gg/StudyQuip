@@ -289,6 +289,28 @@ export function JobProgress({
                 {r.at
                   ? ` · ${Math.max(0, Math.floor(Date.now() / 1000 - r.at))} 秒`
                   : ""}
+                {r.streaming && (
+                  <span className="stream-progress">
+                    {r.first_received_at ? (
+                      <>
+                        已接收 {r.received_events || 0} 个事件 · 正文{" "}
+                        {r.output_characters || 0} 字符 · 思考{" "}
+                        {r.reasoning_characters || 0} 字符 · 工具参数{" "}
+                        {r.tool_argument_characters || 0} 字符
+                        {r.at
+                          ? ` · 首次接收 ${Math.max(0, Math.round(r.first_received_at - r.at))} 秒`
+                          : ""}
+                        {r.last_received_at
+                          ? ` · 距上次接收 ${Math.max(0, Math.floor(Date.now() / 1000 - r.last_received_at))} 秒`
+                          : ""}
+                        {!!r.tool_names?.length &&
+                          ` · 工具：${r.tool_names.join("、")}`}
+                      </>
+                    ) : (
+                      "流式连接已建立，等待首个事件"
+                    )}
+                  </span>
+                )}
               </p>
             ))}
           {p?.last_activity_at && (

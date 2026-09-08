@@ -40,6 +40,7 @@ class Result(BaseModel):
 
 
 def profile(**values: Any) -> ModelProfile:
+    values.setdefault("stream", False)  # Non-stream protocol fixtures; SSE is tested separately.
     return ModelProfile(
         base_url="https://provider.example/v1", api_key="fixture-key", model="fixture-model", **values
     )
@@ -884,3 +885,197 @@ async def test_waiting_request_reloads_capacity_without_releasing_existing_slot(
         finally:
             request.cancel()
             await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol,store", [("chat", False), ("responses", False), ("responses", True)])
+async def test_streaming_tools_preserve_complete_protocol_and_observe_deltas(
+    protocol: str, store: bool
+) -> None:
+    configured = profile(protocol=protocol, store=store, stream=True, retries=0)
+    wires: list[dict[str, Any]] = []
+    observed: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        assert wire["stream"] is True
+        wires.append(wire)
+        number = len(wires)
+        name, arguments = (
+            ("read", '{"id":"block"}') if number == 1 else ("submit_result", '{"answer":"完成"}')
+        )
+        if protocol == "chat":
+            assert wire["stream_options"] == {"include_usage": True}
+            base = {
+                "id": f"chat-{number}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+            }
+            deltas = [
+                {"role": "assistant", "reasoning_content": "先读"},
+                {"reasoning_content": "依据"},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": f"call-{number}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments[:6]},
+                        }
+                    ]
+                },
+                {"tool_calls": [{"index": 0, "function": {"arguments": arguments[6:]}}]},
+                {},
+            ]
+            events = [
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": "tool_calls" if i == len(deltas) - 1 else None,
+                        }
+                    ],
+                }
+                for i, delta in enumerate(deltas)
+            ]
+            events.append(
+                {
+                    **base,
+                    "choices": [],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+                }
+            )
+        else:
+            call = {
+                "id": f"fc-{number}",
+                "type": "function_call",
+                "call_id": f"call-{number}",
+                "name": name,
+                "arguments": arguments,
+                "status": "completed",
+            }
+            result = {
+                "id": f"response-{number}",
+                "object": "response",
+                "created_at": 1,
+                "model": "fixture-model",
+                "status": "completed",
+                "parallel_tool_calls": True,
+                "output": [
+                    {
+                        "id": f"reasoning-{number}",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-encrypted",
+                    },
+                    call,
+                ],
+                "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+            }
+            events = [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {**call, "arguments": ""},
+                    "sequence_number": 1,
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 1,
+                    "item_id": call["id"],
+                    "delta": arguments,
+                    "sequence_number": 2,
+                },
+                {"type": "response.completed", "response": result, "sequence_number": 3},
+            ]
+        content = "".join("data: " + json.dumps(event) + "\n\n" for event in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=content)
+
+    async def read(arguments: dict[str, Any]) -> dict[str, str]:
+        assert arguments == {"id": "block"}
+        return {"text": "原文"}
+
+    async def save(state: dict[str, Any]) -> None:
+        if state.get("activity"):
+            observed.append(copy.deepcopy(state["activity"]))
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {}
+    result = await ai.structured(
+        configured,
+        "检索后回答",
+        Result,
+        tools={"read": ("读取", {"type": "object", "properties": {"id": {"type": "string"}}}, read)},
+        state=state,
+        save=save,
+    )
+    assert result.answer == "完成" and len(wires) == 2
+    assert state["usage"] == {"requests": 2, "input_tokens": 40, "output_tokens": 10}
+    assert any(item.get("tool_argument_characters", 0) >= len('{"id":"block"}') for item in observed)
+    assert any(item.get("last_received_at") for item in observed)
+    if protocol == "chat":
+        assert wires[1]["messages"][2]["reasoning_content"] == "先读依据"
+        assert wires[1]["messages"][3]["tool_call_id"] == "call-1"
+    elif store:
+        assert wires[1]["input"][1:3] == [
+            {"type": "item_reference", "id": "reasoning-1"},
+            {"type": "item_reference", "id": "fc-1"},
+        ]
+    else:
+        assert wires[1]["input"][1]["encrypted_content"] == "opaque-encrypted"
+        assert wires[1]["input"][2]["arguments"] == '{"id":"block"}'
+
+
+@pytest.mark.asyncio
+async def test_stream_interruption_retries_without_accepting_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("studyquip.ai.retry_delay", lambda attempt: 0)
+    configured = profile(stream=True, stream_include_usage=False, retries=1)
+    requests = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        assert "stream_options" not in json.loads(request.content)
+        chunk = {
+            "id": "stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls" if requests > 1 else None,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_result",
+                                    "arguments": '{"answer":"第二次完整返回"}'
+                                    if requests > 1
+                                    else '{"answer":"不能使用"}',
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text="data: " + json.dumps(chunk) + "\n\n"
+        )
+
+    state: dict[str, Any] = {}
+    service = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    result = await service.structured(configured, "测试", Result, state=state)
+    assert requests == 2 and result.answer == "第二次完整返回"
+    assert "不能使用" not in json.dumps(state, ensure_ascii=False)
+    assert ModelProfile(base_url="https://fixture.invalid/v1", api_key="fixture", model="m").stream is True

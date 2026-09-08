@@ -44,6 +44,7 @@ async def test_legacy_models_split_once_and_new_roles_remain_independently_edita
         originals: dict[str, dict[str, Any]] = {}
         for legacy in ("vision", "chat"):
             profile = ModelProfile(
+                stream=False,
                 name=f"旧 {legacy}",
                 base_url="https://fixture.invalid/tenant/v1",
                 api_key="private-fixture-key",
@@ -64,7 +65,10 @@ async def test_legacy_models_split_once_and_new_roles_remain_independently_edita
             "model",
             {
                 **ModelProfile(
-                    base_url="https://fixture.invalid/v1", api_key="vector-fixture", model="embedding"
+                    stream=False,
+                    base_url="https://fixture.invalid/v1",
+                    api_key="vector-fixture",
+                    model="embedding",
                 ).model_dump(),
                 "role": "embedding",
                 "embedding_dimensions": 4096,
@@ -260,6 +264,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
             "model",
             {
                 "role": "book_text",
+                "stream": False,
                 "base_url": "https://fixture.invalid/v1",
                 "api_key": "fixture",
                 "model": "fixture",
@@ -478,6 +483,7 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
             {
                 "name": role,
                 "role": role,
+                "stream": False,
                 "base_url": "https://provider.example/v1",
                 "api_key": "fixture",
                 "model": f"fixture-{role}",
@@ -556,7 +562,7 @@ async def test_book_question_workflow_uses_confirmed_answers_and_fenced_results(
                     {"node_id": item["node_id"], "summary": "介绍牛顿第一定律和惯性。"} for item in payload
                 ]
             }
-        elif "识别一道错题" in prompt:
+        elif "整理错题：" in prompt:
             role = "question_vision" if len(wire["messages"][1]["content"]) > 1 else "question_text"
             assert wire["model"] == f"fixture-{role}"
             result = {
@@ -745,7 +751,11 @@ async def test_question_formulas_preserve_answers_and_ambiguous_fields(tmp_path:
             db.put(
                 "model",
                 ModelProfile(
-                    role=role, base_url="https://fixture.invalid/v1", api_key="fixture", model=role
+                    stream=False,
+                    role=role,
+                    base_url="https://fixture.invalid/v1",
+                    api_key="fixture",
+                    model=role,
                 ).model_dump(),
             )
         subject = db.put("subject", {"name": "数学"})
@@ -805,7 +815,7 @@ async def test_question_formulas_preserve_answers_and_ambiguous_fields(tmp_path:
             assert wire["model"] == ("question_vision" if image_ids else "question_text")
             prompt = wire["messages"][1]["content"][0]["text"]
             assert r"$\frac{x^2}{2}$" in prompt and r"$\ce{H2SO4}$" in prompt
-            assert "不润色叙述" in prompt and "formatting_issues" in prompt
+            assert "不改变内容和题意" in prompt and "formatting_issues" in prompt
             return httpx.Response(
                 200,
                 json={
@@ -911,6 +921,7 @@ async def test_unlimited_summary_and_embedding_batches_do_not_reuse_old_partial_
                 "model",
                 {
                     "role": role,
+                    "stream": False,
                     "model": role,
                     "base_url": "https://fixture.invalid/v1",
                     "api_key": "fixture",
@@ -1044,6 +1055,7 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
     jobs = JobStore(db)
     limit, count = 12, 16
     profile = ModelProfile(
+        stream=False,
         base_url="https://provider.example/v1",
         api_key="fixture",
         model="concurrency-fixture",
@@ -1115,7 +1127,9 @@ async def test_parallel_work_uses_model_capacity_without_hidden_task_or_page_lim
         db.put("model", profile.model_copy(update={"role": "book_vision"}).model_dump())
         db.put(
             "model",
-            profile.model_copy(update={"role": "book_text", "model": "revision-fixture"}).model_dump(),
+            profile.model_copy(
+                update={"role": "book_text", "stream": False, "model": "revision-fixture"}
+            ).model_dump(),
         )
         book = db.put("book", {"title": "并行页识别验收", "asset_ids": []})
         TextbookService(db).ensure_root(book["id"])

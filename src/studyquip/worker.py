@@ -20,6 +20,7 @@ from studyquip.db import Database, runtime_lock
 from studyquip.jobs import JobStore, LeaseLost
 from studyquip.pipelines import HANDLERS, NeedsReview, PipelineContext
 from studyquip.scheduling import WindowClosed
+from studyquip.subjects import ensure_default_subjects
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,7 @@ class Worker:
         stop = stop or asyncio.Event()
         active: set[asyncio.Task[None]] = set()
         try:
+            await asyncio.to_thread(ensure_default_subjects, self.db, self.settings.default_subjects)
             converted = await asyncio.to_thread(split_legacy_model_roles, self.db)
             if converted:
                 logger.info("已拆分 %s 个旧模型配置为教材与题目用途", converted)

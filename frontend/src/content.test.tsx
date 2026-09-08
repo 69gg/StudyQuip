@@ -100,7 +100,7 @@ describe("共用题目与打印渲染", () => {
     expect(html).not.toContain("正确答案");
     expect(html).not.toContain("解题思路测试");
     expect(html).not.toContain("知识点测试");
-    expect(html).toContain("answer-lines");
+    expect(html).not.toContain("answer-lines");
     expect(html).not.toContain("marked-original");
     expect(html).not.toContain("reference-answer");
     expect(html).not.toContain("录入备注");
@@ -137,5 +137,85 @@ describe("共用题目与打印渲染", () => {
     expect(html).not.toContain("katex-error");
     expect(html).not.toContain("<img");
     expect(html).not.toContain("onerror");
+  });
+});
+
+describe("嵌套大题与听力打印", () => {
+  const nested: Question = {
+    ...question,
+    type: "composite",
+    stem: "根据材料回答",
+    options: [],
+    figure_asset_ids: [],
+    figures: [],
+    materials: [
+      {
+        id: "listening",
+        kind: "listening",
+        title: "听力一",
+        text: "只在复习版出现的听力文稿",
+        audio_asset_id: "audio",
+      },
+    ],
+    parts: [
+      {
+        ...question,
+        id: "group",
+        type: "composite",
+        stem: "第二层材料",
+        parts: [
+          {
+            ...question,
+            id: "choice",
+            figures: [],
+            figure_asset_ids: [],
+            error_reason: "误听时间",
+          },
+          {
+            ...question,
+            id: "short",
+            type: "short_answer",
+            stem: "简述理由",
+            options: [],
+            figures: [],
+            figure_asset_ids: [],
+          },
+        ],
+      },
+    ],
+  };
+  it("深层编号、只为简答留白、练习不泄露听力文稿及答案", () => {
+    const html = renderToStaticMarkup(
+      <QuestionContent
+        question={nested}
+        index={0}
+        practice
+        printing
+        blankLines={3}
+      />,
+    );
+    expect(html).toContain("1.1.1.");
+    expect(html).toContain("1.1.2.");
+    expect((html.match(/class="answer-lines"/g) || []).length).toBe(1);
+    expect(html).not.toContain("听力文稿");
+    expect(html).not.toContain("<audio");
+    expect(html).not.toContain("正确答案");
+  });
+  it("复习打印包含文稿、做错原因和叶节点答案", () => {
+    const html = renderToStaticMarkup(
+      <QuestionContent
+        question={nested}
+        index={0}
+        answer
+        explanation
+        knowledge
+        printing
+      />,
+    );
+    expect(html).toContain("只在复习版出现的听力文稿");
+    expect(html).toContain("误听时间");
+    expect(html).toContain("做错原因（原文）");
+    expect((html.match(/<h4>正确答案<\/h4>/g) || []).length).toBe(2);
+    expect(html).not.toContain("<audio");
   });
 });

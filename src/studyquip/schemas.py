@@ -1,9 +1,12 @@
 """HTTP 业务输入及题型完整性校验。"""
 
 import time
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .question_tree import FigureSpec, Material, walk_questions
 
 
 class Option(BaseModel):
@@ -14,8 +17,11 @@ class Option(BaseModel):
 class QuestionInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
     revision: int | None = None
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     subject_id: str = ""
-    type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer"] = "single_choice"
+    type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer", "composite"] = (
+        "single_choice"
+    )
     stem: str = ""
     options: list[Option] = Field(default_factory=list)
     answer: str | list[str] | None = None
@@ -28,11 +34,58 @@ class QuestionInput(BaseModel):
     reference_asset_ids: list[str] = Field(default_factory=list)
     figure_asset_ids: list[str] = Field(default_factory=list)
     book_ids: list[str] = Field(default_factory=list)
+    parts: list["QuestionInput"] = Field(default_factory=list)
+    materials: list[Material] = Field(default_factory=list)
+    rendered_figures: list[FigureSpec] = Field(default_factory=list)
+    figure_requirements: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unique_nodes_and_materials(self) -> "QuestionInput":
+        nodes: set[str] = set()
+        materials: set[str] = set()
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            if node.id and node.id in nodes:
+                raise ValueError("题目树中的节点 ID 不能重复")
+            nodes.add(node.id)
+            for material in node.materials:
+                if material.id in materials:
+                    raise ValueError("题目树中的材料 ID 不能重复")
+                materials.add(material.id)
+            stack.extend(node.parts)
+        return self
 
 
 def validate_question(question: dict[str, Any], require_confirmed: bool = True) -> None:
     if not question.get("subject_id"):
         raise ValueError("请选择科目")
+    seen: set[str] = set()
+    for node in walk_questions(question):
+        identifier = node.get("id")
+        if identifier:
+            if identifier in seen:
+                raise ValueError("题目树中的节点 ID 不能重复")
+            seen.add(identifier)
+        for material in node.get("materials", []):
+            if material.get("kind") == "listening" and not (
+                material.get("text", "").strip() or material.get("audio_asset_id")
+            ):
+                raise ValueError("听力材料需要音频或文稿，二者也可同时提供")
+        if node.get("figure_requirements") and not node.get("figure_asset_ids"):
+            raise ValueError("题目需要补充插图，请上传后确认")
+        if node.get("type") == "composite":
+            if not node.get("parts"):
+                raise ValueError("大题至少需要一个小题")
+        else:
+            if node.get("parts"):
+                raise ValueError("包含小题的节点应设置为大题")
+            validate_question_leaf(node)
+    if require_confirmed and not question.get("answer_confirmed"):
+        raise ValueError("请先确认全部题目的正确答案")
+
+
+def validate_question_leaf(question: dict[str, Any]) -> None:
     if not str(question.get("stem", "")).strip():
         raise ValueError("题干不能为空")
     answer = question.get("answer")
@@ -63,8 +116,6 @@ def validate_question(question: dict[str, Any], require_confirmed: bool = True) 
     elif question_type == "short_answer":
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("简答题答案应为非空文本")
-    if require_confirmed and not question.get("answer_confirmed"):
-        raise ValueError("请先确认正确答案")
 
 
 class BookInput(BaseModel):

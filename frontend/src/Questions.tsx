@@ -5,8 +5,12 @@ import { api, post, put, remove } from "./api";
 import {
   answerText,
   questionTypes,
+  questionNodes,
+  questionTitle,
+  roleLabels,
   type Book,
   type Job,
+  type Model,
   type Question,
   type QuestionType,
   type Subject,
@@ -25,6 +29,13 @@ import {
 } from "./ui";
 import { MathText, QuestionContent } from "./Content";
 import Uploads from "./Uploads";
+import {
+  atPath,
+  changeAt,
+  FiguresEditor,
+  MaterialsEditor,
+  QuestionNavigator,
+} from "./QuestionExtras";
 import {
   ResourceProgress,
   useResourceJobs,
@@ -54,6 +65,10 @@ export function emptyQuestion(subjectId: string): Question {
     reference_asset_ids: [],
     figure_asset_ids: [],
     book_ids: [],
+    parts: [],
+    materials: [],
+    rendered_figures: [],
+    figure_requirements: [],
   };
 }
 export default function Questions({
@@ -98,9 +113,18 @@ export default function Questions({
       (!subject || q.subject_id === subject) &&
       (!type || q.type === type) &&
       (!search ||
-        [q.stem, q.error_reason, q.notes, q.reference_text].some((t) =>
-          t?.toLowerCase().includes(search.toLowerCase()),
-        )),
+        questionNodes(q)
+          .flatMap((node) => [
+            node.stem,
+            node.error_reason,
+            node.notes,
+            node.reference_text,
+            ...(node.materials || []).flatMap((material) => [
+              material.title,
+              material.text,
+            ]),
+          ])
+          .some((t) => t?.toLowerCase().includes(search.toLowerCase()))),
   );
   return (
     <>
@@ -227,10 +251,7 @@ export default function Questions({
                   />
                   {q.explanation_stale && <span>讲解待更新</span>}
                 </div>
-                <MathText
-                  className="line-clamp"
-                  text={q.stem || "待整理的题目"}
-                />
+                <MathText className="line-clamp" text={questionTitle(q)} />
                 {q.notes && <p className="record-note">{q.notes}</p>}
               </button>
               <ArrowUpRight
@@ -351,46 +372,84 @@ function QuestionEditor({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [q, setQ] = useState<Question>(structuredClone(initial)),
+  const [root, setRoot] = useState<Question>(structuredClone(initial)),
     [busy, setBusy] = useState(false),
     [dirty, setDirty] = useState(false),
-    [schedule, setSchedule] = useState<"extract" | "explain" | null>(null),
+    [schedule, setSchedule] = useState<"extract" | "explain" | "audio" | null>(
+      null,
+    ),
+    [path, setPath] = useState<number[]>([]),
     [preview, setPreview] = useState(false);
+  const q = atPath(root, path);
+  const models = useRemote<Model[]>("/models", []);
   const notice = useNotice();
-  const tasks = useResourceJobs(q.id, ["question_extract", "question_explain"]);
+  const tasks = useResourceJobs(root.id, [
+    "question_extract",
+    "question_explain",
+    "question_audio",
+  ]);
   useJobCompletion(tasks.jobs, () => {
-    if (!dirty && q.id)
-      void api<Question>(`/questions/${q.id}`)
-        .then(setQ)
+    if (!dirty && root.id)
+      void api<Question>(`/questions/${root.id}`)
+        .then(setRoot)
         .catch((e) => notice(e.message, true));
     onSaved();
   });
+  function replace(value: Question) {
+    setDirty(true);
+    setRoot({ ...value, answer_confirmed: false, explanation_stale: true });
+  }
   function update<K extends keyof Question>(key: K, value: Question[K]) {
     setDirty(true);
-    setQ((old) => ({
+    setRoot((old) => ({
+      ...changeAt(old, path, (node) => ({
+        ...node,
+        [key]: value,
+        formatting_warnings: ["stem", "options"].includes(key)
+          ? []
+          : node.formatting_warnings,
+        explanation_stale: !!node.explanation,
+      })),
+      answer_confirmed: [
+        "answer",
+        "type",
+        "options",
+        "stem",
+        "asset_ids",
+        "reference_text",
+        "reference_asset_ids",
+        "materials",
+        "rendered_figures",
+        "figure_asset_ids",
+        "parts",
+      ].includes(key)
+        ? false
+        : old.answer_confirmed,
+      explanation_stale: true,
+    }));
+  }
+  function updateRoot<K extends keyof Question>(key: K, value: Question[K]) {
+    setDirty(true);
+    setRoot((old) => ({
       ...old,
       [key]: value,
-      ...(["stem", "options"].includes(key) ? { formatting_warnings: [] } : {}),
-      ...(old.explanation ? { explanation_stale: true } : {}),
-      ...(["answer", "type", "options", "stem"].includes(key)
-        ? { answer_confirmed: false }
-        : {}),
+      explanation_stale: true,
     }));
   }
   async function save(confirm = false): Promise<Question> {
-    if (!q.subject_id)
+    if (!root.subject_id)
       throw new Error("请先在设置中添加科目，并为题目选择科目。");
-    let saved = q.id
-      ? await put<Question>(`/questions/${q.id}`, q)
-      : await post<Question>("/questions", q);
-    setQ(saved);
+    let saved = root.id
+      ? await put<Question>(`/questions/${root.id}`, root)
+      : await post<Question>("/questions", root);
+    setRoot(saved);
     setDirty(false);
     onSaved();
     if (confirm) {
       saved = await post<Question>(`/questions/${saved.id}/confirm`, {
         revision: saved.revision,
       });
-      setQ(saved);
+      setRoot(saved);
       onSaved();
     }
     return saved;
@@ -398,7 +457,14 @@ function QuestionEditor({
   async function handleSave(confirm = false) {
     setBusy(true);
     try {
-      await save(confirm);
+      const saved = await save(confirm);
+      const needed = saved.audio_pending_roles?.some((role) =>
+        models.data.some((model) => model.role === role),
+      );
+      if (needed && !tasks.blocked) {
+        await post<Job>(`/questions/${saved.id}/audio`);
+        tasks.reload();
+      }
       notice(confirm ? "正确答案已确认。" : "题目已保存。");
     } catch (e) {
       notice((e as Error).message, true);
@@ -409,9 +475,9 @@ function QuestionEditor({
   function close() {
     if (!dirty || window.confirm("有尚未保存的修改，确定关闭吗？")) onClose();
   }
-  const matchingBooks = books.filter((b) => b.subject_id === q.subject_id);
+  const matchingBooks = books.filter((b) => b.subject_id === root.subject_id);
   return (
-    <Modal title={q.id ? "编辑错题" : "录入错题"} onClose={close} wide>
+    <Modal title={root.id ? "编辑错题" : "录入错题"} onClose={close} wide>
       <div className="editor-toolbar">
         <div className="inline-actions">
           <Button
@@ -428,7 +494,7 @@ function QuestionEditor({
           </Button>
         </div>
         <div className="inline-actions">
-          {q.id && (
+          {root.id && (
             <Button
               onClick={async () => {
                 if (
@@ -437,7 +503,7 @@ function QuestionEditor({
                 )
                   return;
                 try {
-                  setQ(await api<Question>(`/questions/${q.id}`));
+                  setRoot(await api<Question>(`/questions/${root.id}`));
                   setDirty(false);
                 } catch (e) {
                   notice((e as Error).message, true);
@@ -453,21 +519,31 @@ function QuestionEditor({
           >
             {tasks.active.length ? "题目处理中" : "AI 整理题目"}
           </Button>
+          {questionNodes(root).some((node) =>
+            node.materials?.some((material) => material.kind === "listening"),
+          ) && (
+            <Button
+              disabled={busy || tasks.blocked}
+              onClick={() => setSchedule("audio")}
+            >
+              补全听力资料
+            </Button>
+          )}
         </div>
       </div>
-      {q.id && (
+      {root.id && (
         <ResourceProgress
-          resourceId={q.id}
-          kinds={["question_extract", "question_explain"]}
+          resourceId={root.id}
+          kinds={["question_extract", "question_explain", "question_audio"]}
         />
       )}
       <p className="hint">
         AI
-        整理会规范题干和选项中的公式，保留题意与原数据。完成后可切换预览，检查并重新确认答案。
+        整理可润色题干和选项、规范公式，并按需检索教材；保留原题意、条件与数值。完成后可切换预览，检查并重新确认答案。
       </p>
       {!!q.formatting_warnings?.length && (
         <div className="gentle-notice" role="status">
-          <strong>公式需要核对</strong>
+          <strong>表述需要核对</strong>
           <ul>
             {q.formatting_warnings.map((message, index) => (
               <li key={index}>{message}</li>
@@ -475,33 +551,63 @@ function QuestionEditor({
           </ul>
         </div>
       )}
+      {!!root.audio_pending_roles?.length && (
+        <p className="gentle-notice">
+          听力待补全：
+          {root.audio_pending_roles
+            .map(
+              (role) =>
+                `${roleLabels[role]}${models.data.some((model) => model.role === role) ? "已配置" : "未配置"}`,
+            )
+            .join("、")}
+          。未配置时保留原材料，可到设置补充后继续。
+        </p>
+      )}
+      {!preview && (
+        <QuestionNavigator
+          root={root}
+          path={path}
+          onSelect={setPath}
+          onChange={replace}
+          create={() => ({ ...emptyQuestion(root.subject_id), id: uuidv4() })}
+        />
+      )}
       {preview ? (
-        <QuestionContent question={q} answer explanation knowledge />
+        <QuestionContent question={root} answer explanation knowledge />
       ) : (
         <div className="editor-grid">
           <div className="stack">
             <div className="form-grid">
-              <Field label="科目">
-                <select
-                  value={q.subject_id}
-                  onChange={(e) => {
-                    update("subject_id", e.target.value);
-                    update("book_ids", []);
-                  }}
-                >
-                  <option value="">选择科目</option>
-                  {subjects.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {path.length === 0 && (
+                <Field label="科目">
+                  <select
+                    value={root.subject_id}
+                    onChange={(e) => {
+                      updateRoot("subject_id", e.target.value);
+                      updateRoot("book_ids", []);
+                    }}
+                  >
+                    <option value="">选择科目</option>
+                    {subjects.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
               <Field label="题型">
                 <select
                   value={q.type}
                   onChange={(e) => {
                     const type = e.target.value as QuestionType;
+                    if (type !== "composite" && q.parts?.length) {
+                      notice(
+                        "请先移动或删除子题，再将此节点改为基础题型。",
+                        true,
+                      );
+                      return;
+                    }
                     update("type", type);
                     update("answer", "");
                   }}
@@ -522,7 +628,7 @@ function QuestionEditor({
                 update("figure_asset_ids", [...(q.figure_asset_ids || []), id])
               }
             />
-            <Field label="题干">
+            <Field label={q.type === "composite" ? "大题题干（可选）" : "题干"}>
               <textarea
                 className="stem-input"
                 value={q.stem}
@@ -530,6 +636,10 @@ function QuestionEditor({
                 placeholder="输入题目，或上传图片后使用 AI 整理。"
               />
             </Field>
+            <MaterialsEditor
+              value={q.materials || []}
+              onChange={(value) => update("materials", value)}
+            />
             {["single_choice", "multiple_choice"].includes(q.type) && (
               <div className="stack compact">
                 <div className="row-between">
@@ -579,56 +689,84 @@ function QuestionEditor({
               </div>
             )}
             <Uploads
-              label="练习题配图"
+              label="题目插图（可选）"
               ids={q.figure_asset_ids || []}
               onChange={(ids) => update("figure_asset_ids", ids)}
             />
-            <div className="answer-panel">
-              <div className="row-between">
-                <h3>正确答案</h3>
-                <span
-                  className={q.answer_confirmed ? "confirmed" : "unconfirmed"}
-                >
-                  {q.answer_confirmed ? "已由你确认" : "需要你确认"}
-                </span>
+            <FiguresEditor
+              value={q.rendered_figures || []}
+              onChange={(value) => update("rendered_figures", value)}
+            />
+            {!!q.figure_requirements?.length && (
+              <div className="gentle-notice">
+                <strong>需要补充插图</strong>
+                <ul>
+                  {q.figure_requirements.map((message, i) => (
+                    <li key={i}>{message}</li>
+                  ))}
+                </ul>
+                <Button onClick={() => update("figure_requirements", [])}>
+                  已核对，现有插图足够
+                </Button>
               </div>
-              <AnswerInput
-                question={q}
-                value={q.answer}
-                onChange={(value) => update("answer", value)}
-                label="答案内容"
-              />
-              <p className="hint">
-                可从参考解析提取答案；生成讲解前，必须由你检查并确认。
-              </p>
-              <Button busy={busy} onClick={() => void handleSave(true)}>
-                保存并确认答案
-              </Button>
-            </div>
+            )}
+            {q.type !== "composite" && (
+              <div className="answer-panel">
+                <div className="row-between">
+                  <h3>正确答案</h3>
+                  <span
+                    className={q.answer_confirmed ? "confirmed" : "unconfirmed"}
+                  >
+                    {q.answer_confirmed ? "已由你确认" : "需要你确认"}
+                  </span>
+                </div>
+                <AnswerInput
+                  question={q}
+                  value={q.answer}
+                  onChange={(value) => update("answer", value)}
+                  label="答案内容"
+                />
+                <p className="hint">
+                  可从参考解析提取答案；生成讲解前，必须由你检查并确认。
+                </p>
+                <Button
+                  busy={busy}
+                  disabled={tasks.blocked}
+                  onClick={() => void handleSave(true)}
+                >
+                  保存并确认全部答案
+                </Button>
+              </div>
+            )}
           </div>
           <aside className="editor-aside stack">
-            <div>
-              <h3>参考教材</h3>
+            <details>
+              <summary>
+                参考教材 · 可选
+                {root.book_ids.length
+                  ? ` · 已选 ${root.book_ids.length} 本`
+                  : ""}
+              </summary>
               <p className="hint">不选择时，自动检索同科目的全部教材。</p>
               <div className="book-choices">
                 {matchingBooks.map((book) => (
                   <Check
                     key={book.id}
                     label={book.title}
-                    checked={q.book_ids?.includes(book.id) || false}
+                    checked={root.book_ids?.includes(book.id) || false}
                     onChange={(v) =>
-                      update(
+                      updateRoot(
                         "book_ids",
                         v
-                          ? [...(q.book_ids || []), book.id]
-                          : q.book_ids.filter((id) => id !== book.id),
+                          ? [...(root.book_ids || []), book.id]
+                          : root.book_ids.filter((id) => id !== book.id),
                       )
                     }
                   />
                 ))}
               </div>
-            </div>
-            <details open>
+            </details>
+            <details>
               <summary>参考答案与解析</summary>
               <div className="stack">
                 <Field label="参考解析文本">
@@ -688,7 +826,16 @@ function QuestionEditor({
             已生成讲解{q.explanation_stale ? " · 题目已修改，需要重新生成" : ""}
           </summary>
           <QuestionContent
-            question={{ ...q, stem: "", options: [], figure_asset_ids: [] }}
+            question={{
+              ...q,
+              stem: "",
+              options: [],
+              figure_asset_ids: [],
+              figures: [],
+              rendered_figures: [],
+              materials: [],
+              parts: [],
+            }}
             explanation
             knowledge
           />
@@ -696,13 +843,13 @@ function QuestionEditor({
       )}
       <div className="editor-footer">
         <div>
-          {q.id && (
+          {root.id && (
             <Button
               kind="danger"
               onClick={async () => {
                 if (!window.confirm("确定删除这道错题吗？")) return;
                 try {
-                  await remove(`/questions/${q.id}`);
+                  await remove(`/questions/${root.id}`);
                   onSaved();
                   onClose();
                 } catch (e) {
@@ -715,12 +862,23 @@ function QuestionEditor({
           )}
         </div>
         <div className="inline-actions">
-          <Button busy={busy} onClick={() => void handleSave()}>
+          <Button
+            busy={busy}
+            disabled={tasks.blocked}
+            onClick={() => void handleSave(true)}
+          >
+            确认全部答案
+          </Button>
+          <Button
+            busy={busy}
+            disabled={tasks.blocked}
+            onClick={() => void handleSave()}
+          >
             保存
           </Button>
           <Button
             kind="primary"
-            disabled={!q.answer_confirmed || dirty || tasks.blocked}
+            disabled={!root.answer_confirmed || dirty || tasks.blocked}
             onClick={() => setSchedule("explain")}
           >
             {tasks.active.length ? "已有处理任务" : "生成讲解"}
@@ -729,10 +887,16 @@ function QuestionEditor({
       </div>
       {schedule && (
         <ScheduleDialog
-          title={schedule === "extract" ? "AI 整理题目" : "生成讲解"}
+          title={
+            schedule === "extract"
+              ? "AI 整理题目"
+              : schedule === "audio"
+                ? "补全听力资料"
+                : "生成讲解"
+          }
           onClose={() => setSchedule(null)}
           onSubmit={async (timing) => {
-            const saved = dirty || !q.id ? await save() : q;
+            const saved = dirty || !root.id ? await save() : root;
             return post<Job>(`/questions/${saved.id}/${schedule}`, timing);
           }}
         />
@@ -807,7 +971,7 @@ function ExportDialog({
           {questions.map((q, i) => (
             <div className="export-order" key={q.id}>
               <span>
-                {i + 1}. {q.stem.slice(0, 34) || "题目"}
+                {i + 1}. {questionTitle(q).slice(0, 34)}
               </span>
               <Button
                 disabled={i === 0}
@@ -860,7 +1024,9 @@ function ExportDialog({
               answer={mode === "review" && answer}
               explanation={mode === "review" && explanation}
               knowledge={mode === "review" && knowledge}
-              blankLines={blank}
+              practice={mode === "practice"}
+              printing
+              blankLines={mode === "practice" ? blank : 0}
             />
           ))}
         </div>

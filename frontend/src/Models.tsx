@@ -33,14 +33,28 @@ export default function Models({
   const tasks = useJobs();
   const [editing, setEditing] = useState<Model | null>(null),
     [testing, setTesting] = useState<Model | null>(null),
-    [subject, setSubject] = useState("");
+    [subject, setSubject] = useState(""),
+    [tab, setTab] = useState<"models" | "subjects">("models"),
+    [group, setGroup] = useState("question"),
+    [renaming, setRenaming] = useState<Subject | null>(null);
   const notice = useNotice();
-  function create(): Model {
+  const groups: Record<string, { label: string; roles: Model["role"][] }> = {
+    question: { label: "题目", roles: ["question_vision", "question_text"] },
+    book: { label: "教材", roles: ["book_vision", "book_text"] },
+    search: { label: "检索", roles: ["embedding"] },
+    audio: { label: "听力", roles: ["speech_recognition", "speech_synthesis"] },
+  };
+  function create(role: Model["role"] = groups[group].roles[0]): Model {
     return {
       id: "",
       revision: 0,
       name: "",
-      role: "question_text",
+      role,
+      stream: true,
+      stream_include_usage: true,
+      voice: "",
+      audio_language: null,
+      audio_speed: null,
       protocol: "chat",
       base_url: "",
       model: "",
@@ -76,100 +90,193 @@ export default function Models({
           ＋ 添加模型配置
         </Button>
       </div>
-      <h2>模型</h2>
-      <State
-        loading={remote.loading}
-        error={remote.error}
-        empty={!remote.data.length}
-      >
-        分别配置教材与题目的图片、文本模型，再按需配置向量嵌入模型。不同用途可以使用同一个模型。
-      </State>
-      <div className="record-list">
-        {remote.data.map((model) => (
-          <div className="model-row" key={model.id}>
-            <button
-              className="record-main"
-              onClick={() => setEditing({ ...model, api_key: "" })}
-            >
-              <div className="record-meta">
-                <span>{roleLabels[model.role]}</span>
-                <span>
-                  {model.role === "embedding"
-                    ? "Embeddings"
-                    : model.protocol === "chat"
-                      ? "Chat Completions"
-                      : "Responses"}
-                </span>
-              </div>
-              <h3>{model.name || model.model}</h3>
-              <p className="model-subtitle">
-                {model.model} · 并发{" "}
-                {model.effective_max_concurrency || model.max_concurrency}
-                {model.windows?.length
-                  ? ` · ${model.windows.map((w) => `${w.start}–${w.end}`).join("、")}`
-                  : " · 全天可用"}
-              </p>
-            </button>
-            <div className="inline-actions">
-              <Button
-                disabled={
-                  !tasks.ready ||
-                  !!tasks.error ||
-                  matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
-                    isActiveJob,
-                  )
-                }
-                onClick={() => setTesting(model)}
-              >
-                {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
-                  isActiveJob,
-                )
-                  ? "测试已安排"
-                  : "测试连接"}
-              </Button>
-              <Button onClick={() => setEditing({ ...model, api_key: "" })}>
-                编辑
-              </Button>
-            </div>
-            {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
-              isActiveJob,
-            ) && (
-              <ResourceProgress resourceId={model.id} kinds={["model_test"]} />
-            )}
-          </div>
-        ))}
-      </div>
-      <section className="settings-section">
-        <h2>科目</h2>
-        <div className="subject-list">
-          {subjects.map((s) => (
-            <span key={s.id}>{s.name}</span>
-          ))}
-        </div>
-        <form
-          className="inline-actions"
-          onSubmit={async (e) => {
-            e.preventDefault();
-            try {
-              await post("/subjects", { name: subject.trim() });
-              setSubject("");
-              onSubjectsChanged();
-              notice("科目已添加。");
-            } catch (error) {
-              notice((error as Error).message, true);
-            }
-          }}
+      <div className="settings-tabs" role="tablist" aria-label="设置分类">
+        <button
+          role="tab"
+          aria-selected={tab === "models"}
+          onClick={() => setTab("models")}
         >
-          <input
-            aria-label="新科目名称"
-            required
-            placeholder="添加科目"
-            value={subject}
-            onChange={(e) => setSubject(e.target.value)}
-          />
-          <Button type="submit">添加</Button>
-        </form>
-      </section>
+          模型连接
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "subjects"}
+          onClick={() => setTab("subjects")}
+        >
+          科目管理
+        </button>
+      </div>
+      {tab === "models" && (
+        <>
+          <div className="filter-row model-purpose-tabs">
+            {Object.entries(groups).map(([key, value]) => (
+              <Button
+                key={key}
+                kind={group === key ? "active" : ""}
+                onClick={() => setGroup(key)}
+              >
+                {value.label}
+              </Button>
+            ))}
+          </div>
+          <p className="hint">
+            按用途配置；同一用途存在多份配置时使用最早创建的一份。保存后后续处理单元生效。
+          </p>
+          {groups[group].roles
+            .filter((role) => !remote.data.some((model) => model.role === role))
+            .map((role) => (
+              <div className="missing-model-row" key={role}>
+                <div>
+                  <strong>{roleLabels[role]}</strong>
+                  <p className="hint">{roleDescriptions[role]}</p>
+                </div>
+                <Button onClick={() => setEditing(create(role))}>配置</Button>
+              </div>
+            ))}
+          <State
+            loading={remote.loading}
+            error={remote.error}
+            empty={!remote.data.length}
+          >
+            分别配置教材与题目的图片、文本模型，再按需配置向量嵌入模型。不同用途可以使用同一个模型。
+          </State>
+          <div className="record-list">
+            {remote.data
+              .filter((model) => groups[group].roles.includes(model.role))
+              .map((model) => (
+                <div className="model-row" key={model.id}>
+                  <button
+                    className="record-main"
+                    onClick={() => setEditing({ ...model, api_key: "" })}
+                  >
+                    <div className="record-meta">
+                      <span>{roleLabels[model.role]}</span>
+                      <span>
+                        {model.role.startsWith("speech_")
+                          ? "Audio"
+                          : model.role === "embedding"
+                            ? "Embeddings"
+                            : model.protocol === "chat"
+                              ? "Chat Completions"
+                              : "Responses"}
+                      </span>
+                    </div>
+                    <h3>{model.name || model.model}</h3>
+                    <p className="model-subtitle">
+                      {model.model} · 并发{" "}
+                      {model.effective_max_concurrency || model.max_concurrency}
+                      {model.windows?.length
+                        ? ` · ${model.windows.map((w) => `${w.start}–${w.end}`).join("、")}`
+                        : " · 全天可用"}
+                    </p>
+                  </button>
+                  <div className="inline-actions">
+                    <Button
+                      disabled={
+                        !tasks.ready ||
+                        !!tasks.error ||
+                        matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+                          isActiveJob,
+                        )
+                      }
+                      onClick={() => setTesting(model)}
+                    >
+                      {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+                        isActiveJob,
+                      )
+                        ? "测试已安排"
+                        : "测试连接"}
+                    </Button>
+                    <Button
+                      onClick={() => setEditing({ ...model, api_key: "" })}
+                    >
+                      编辑
+                    </Button>
+                  </div>
+                  {matchingJobs(tasks.jobs, model.id, ["model_test"]).some(
+                    isActiveJob,
+                  ) && (
+                    <ResourceProgress
+                      resourceId={model.id}
+                      kinds={["model_test"]}
+                    />
+                  )}
+                </div>
+              ))}
+          </div>
+        </>
+      )}
+      {tab === "subjects" && (
+        <section className="settings-section">
+          <h2>科目</h2>
+          <div className="subject-list">
+            {subjects.map((s) => (
+              <button type="button" key={s.id} onClick={() => setRenaming(s)}>
+                {s.name}
+                <small>重命名</small>
+              </button>
+            ))}
+          </div>
+          <form
+            className="inline-actions"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                await post("/subjects", { name: subject.trim() });
+                setSubject("");
+                onSubjectsChanged();
+                notice("科目已添加。");
+              } catch (error) {
+                notice((error as Error).message, true);
+              }
+            }}
+          >
+            <input
+              aria-label="新科目名称"
+              required
+              placeholder="添加科目"
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+            />
+            <Button type="submit">添加</Button>
+          </form>
+        </section>
+      )}
+      {renaming && (
+        <Modal title="重命名科目" onClose={() => setRenaming(null)}>
+          <form
+            className="stack"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              try {
+                await put(`/subjects/${renaming.id}`, {
+                  name: renaming.name,
+                  revision: renaming.revision,
+                });
+                onSubjectsChanged();
+                setRenaming(null);
+                notice("科目已重命名，题目与教材关联已保留。");
+              } catch (error) {
+                notice((error as Error).message, true);
+              }
+            }}
+          >
+            <Field label="科目名称">
+              <input
+                required
+                value={renaming.name}
+                onChange={(event) =>
+                  setRenaming({ ...renaming, name: event.target.value })
+                }
+              />
+            </Field>
+            <p className="hint">保留该科目的题目、教材和历史数据。</p>
+            <Button kind="primary" type="submit">
+              保存名称
+            </Button>
+          </form>
+        </Modal>
+      )}
       <section className="settings-section about">
         <h2>StudyQuip</h2>
         <p>
@@ -215,6 +322,8 @@ function ModelEditor({
   function update<K extends keyof Model>(key: K, value: Model[K]) {
     setModel((old) => ({ ...old, [key]: value }));
   }
+  const audio = model.role.startsWith("speech_");
+  const generative = !audio && model.role !== "embedding";
   function numberField(
     key: keyof Model,
     label: string,
@@ -280,9 +389,8 @@ function ModelEditor({
           保存后，后续处理单元使用最新模型和生成参数；并发、可用时段、超时与重试设置在后续请求生效。已发出的请求继续完成，无需重启服务。
         </p>
         <div className="form-grid">
-          <Field label="配置名称">
+          <Field label="配置名称（可选）">
             <input
-              required
               value={model.name}
               onChange={(e) => update("name", e.target.value)}
               placeholder="便于识别的名称"
@@ -337,7 +445,7 @@ function ModelEditor({
               onChange={(e) => update("api_key", e.target.value)}
             />
           </Field>
-          {model.role !== "embedding" && (
+          {generative && (
             <Field label="API 类型">
               <select
                 value={model.protocol}
@@ -351,9 +459,25 @@ function ModelEditor({
             </Field>
           )}
         </div>
-        {model.role !== "embedding" && (
+        {generative && (
           <>
             <h3 className="form-section-title">生成参数</h3>
+            <Check
+              label="流式请求（实时显示接收进度）"
+              checked={model.stream ?? true}
+              onChange={(value) => update("stream", value)}
+            />
+            {(model.stream ?? true) && model.protocol === "chat" && (
+              <Check
+                label="请求流式用量统计"
+                checked={model.stream_include_usage ?? true}
+                onChange={(value) => update("stream_include_usage", value)}
+              />
+            )}
+            <p className="hint">
+              默认流式。服务商不支持时可关闭；关闭用量统计仅省略
+              stream_options，不改变流式传输。
+            </p>
             <div className="form-grid">
               <Field
                 label="Thinking"
@@ -460,6 +584,38 @@ function ModelEditor({
               </Field>
             )}
           </>
+        )}
+        {audio && (
+          <div className="form-grid">
+            {model.role === "speech_synthesis" ? (
+              <>
+                <Field label="音色（voice）" hint="填写服务商支持的音色名称。">
+                  <input
+                    required
+                    value={model.voice || ""}
+                    onChange={(event) => update("voice", event.target.value)}
+                  />
+                </Field>
+                {numberField(
+                  "audio_speed",
+                  "语速",
+                  "留空使用服务商默认值。",
+                  true,
+                  0.1,
+                  "0.1",
+                )}
+              </>
+            ) : (
+              <Field label="语言（可选）" hint="例如 en；留空自动识别。">
+                <input
+                  value={model.audio_language || ""}
+                  onChange={(event) =>
+                    update("audio_language", event.target.value || null)
+                  }
+                />
+              </Field>
+            )}
+          </div>
         )}
         {model.role === "embedding" && (
           <>
@@ -595,7 +751,7 @@ function ModelEditor({
                 "自动重试次数",
                 "网络错误和模型格式错误分别使用此次数；0 表示不自动重试。",
               )}
-              {model.role !== "embedding" &&
+              {generative &&
                 numberField(
                   "max_tool_rounds",
                   "最多工具调用轮数",
@@ -603,7 +759,7 @@ function ModelEditor({
                   false,
                   1,
                 )}
-              {model.role !== "embedding" &&
+              {generative &&
                 numberField(
                   "image_tokens",
                   "每张图片预估 token",
@@ -630,7 +786,7 @@ function ModelEditor({
                 />
               </Field>
             </div>
-            {model.role !== "embedding" && (
+            {generative && (
               <>
                 <Check
                   label="启用严格工具格式（需要服务商支持）"

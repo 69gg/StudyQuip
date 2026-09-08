@@ -13,10 +13,15 @@ from sqlalchemy.engine import Connection
 from .config import Settings
 from .db import Database
 from .media import safe_path
+from .question_tree import figure_asset_ids, leaf_questions, walk_questions
 from .schemas import ExportInput, validate_question
 
 
 def explanation_stale(db: Database, question: dict[str, Any]) -> bool:
+    return any(node_explanation_stale(db, node) for node in walk_questions(question))
+
+
+def node_explanation_stale(db: Database, question: dict[str, Any]) -> bool:
     if question.get("explanation_stale"):
         return True
     explanation = question.get("explanation") or {}
@@ -51,7 +56,7 @@ def create_snapshot(db: Database, spec: ExportInput, conn: Connection | None = N
             raise ValueError("所选题目不存在")
         validate_question(question)
         if spec.mode == "review" and (spec.include_explanation or spec.include_knowledge):
-            if not question.get("explanation"):
+            if any(not node.get("explanation") for node in leaf_questions(question)):
                 raise ValueError("所选题目尚无讲解，请先生成或取消包含讲解和知识点")
             if explanation_stale(db, question):
                 raise ValueError("讲解已过期，请重新生成或取消包含讲解和知识点")
@@ -77,7 +82,7 @@ def check_export_token(db: Database, id: str, token: str | None, asset_id: str |
     if expiry is None or expiry < time.time():
         return False
     if asset_id:
-        return any(asset_id in question.get("figure_asset_ids", []) for question in snapshot["questions"])
+        return any(asset_id in figure_asset_ids(question) for question in snapshot["questions"])
     return True
 
 
@@ -85,8 +90,8 @@ def public_snapshot(db: Database, snapshot: dict[str, Any], token: str | None = 
     clean = {
         key: value for key, value in snapshot.items() if key not in {"token", "token_expires_at", "path"}
     }
-    questions: list[dict[str, Any]] = []
-    for question in snapshot["questions"]:
+
+    def present(question: dict[str, Any]) -> dict[str, Any]:
         figures: list[dict[str, Any]] = []
         for asset_id in question.get("figure_asset_ids", []):
             asset = db.get("asset", asset_id)
@@ -96,8 +101,13 @@ def public_snapshot(db: Database, snapshot: dict[str, Any], token: str | None = 
             figures.append(
                 {"id": asset_id, "name": asset["name"], "url": f"/api/assets/{asset_id}/preview{query}"}
             )
-        questions.append({**question, "figures": figures})
-    clean["questions"] = questions
+        return {
+            **question,
+            "figures": figures,
+            "parts": [present(part) for part in question.get("parts", [])],
+        }
+
+    clean["questions"] = [present(question) for question in snapshot["questions"]]
     if snapshot.get("status") == "completed":
         clean["url"] = f"/api/exports/{snapshot['id']}/file"
     return clean

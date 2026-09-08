@@ -7,6 +7,8 @@ export function printContentOptions(snapshot: ExportSnapshot) {
     answer: review && snapshot.include_answer,
     explanation: review && snapshot.include_explanation,
     knowledge: review && snapshot.include_knowledge,
-    blankLines: snapshot.blank_lines,
+    blankLines: review ? 0 : snapshot.blank_lines,
+    practice: !review,
+    printing: true,
   };
 }

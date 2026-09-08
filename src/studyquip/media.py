@@ -61,6 +61,11 @@ def store_upload(settings: Settings, filename: str, content: bytes) -> dict[str,
     identifier = str(uuid.uuid4())
     name = Path(filename).name
     suffix = Path(name).suffix.lower()
+    audio_type = audio_mime(content, suffix)
+    if audio_type:
+        path = settings.files_dir / f"{identifier}{suffix}"
+        path.write_bytes(content)
+        return _asset(settings, path, name, audio_type, asset_id=identifier)
     if content.startswith(b"%PDF-"):
         path = settings.files_dir / f"{identifier}.pdf"
         path.write_bytes(content)
@@ -104,6 +109,25 @@ def image_data_url(settings: Settings, asset: dict[str, Any]) -> str:
     path = safe_path(settings, asset.get("preview_path") or asset["path"])
     mime = "image/jpeg" if asset.get("preview_path") else asset.get("mime", "image/png")
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+
+def audio_mime(content: bytes, suffix: str) -> str | None:
+    """Recognize supported audio containers, never trust the uploaded MIME header."""
+    if suffix == ".wav" and content.startswith(b"RIFF") and content[8:12] == b"WAVE":
+        return "audio/wav"
+    if suffix in {".mp3", ".mpeg", ".mpga"} and (
+        content.startswith(b"ID3") or (len(content) > 1 and content[0] == 255 and content[1] & 224 == 224)
+    ):
+        return "audio/mpeg"
+    if suffix in {".ogg", ".oga", ".opus"} and content.startswith(b"OggS"):
+        return "audio/ogg"
+    if suffix == ".flac" and content.startswith(b"fLaC"):
+        return "audio/flac"
+    if suffix in {".m4a", ".mp4"} and content[4:8] == b"ftyp":
+        return "audio/mp4"
+    if suffix == ".webm" and content.startswith(b"\x1a\x45\xdf\xa3"):
+        return "audio/webm"
+    return None
 
 
 def crop_asset(settings: Settings, asset: dict[str, Any], box: list[float]) -> dict[str, Any]:

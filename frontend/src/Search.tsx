@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { post } from "./api";
 import { MathText } from "./Content";
 import type { Book, Job, Subject } from "./types";
-import { Button, Check, Field, useNotice } from "./ui";
+import { Button, Check, Field, useNotice, useRemote } from "./ui";
 import { useJobs, isActiveJob, JobProgress } from "./JobProgress";
 type SearchHit = {
   id?: string;
@@ -28,10 +28,31 @@ export default function Search({
     [selected, setSelected] = useState<string[]>([]),
     [mode, setMode] = useState("hybrid"),
     [keyword, setKeyword] = useState("any"),
+    [node, setNode] = useState(""),
+    [bookQuery, setBookQuery] = useState(""),
+    [submitted, setSubmitted] = useState(""),
     [busy, setBusy] = useState(false),
     [results, setResults] = useState<SearchHit[] | null>(null),
     [job, setJob] = useState<Job | null>(null);
+  const nodes = useRemote<{ id: string; title: string; parent_id?: string }[]>(
+    selected.length === 1 ? `/books/${selected[0]}/nodes` : null,
+    [],
+  );
   const notice = useNotice();
+  function nodeLabel(id: string): string {
+    const chain: string[] = [],
+      seen = new Set<string>();
+    let next: string | undefined = id;
+    while (next && !seen.has(next)) {
+      seen.add(next);
+      const item = nodes.data.find((candidate) => candidate.id === next);
+      if (!item) break;
+      chain.unshift(item.title);
+      next = item.parent_id;
+    }
+    return chain.join(" › ");
+  }
+  useEffect(() => setNode(""), [selected.join(",")]);
   const tasks = useJobs();
   const restored = useRef(false);
   useEffect(() => {
@@ -43,6 +64,7 @@ export default function Search({
         : undefined;
     if (!restored.current && current?.input) {
       setQuery(String(current.input.query || ""));
+      setSubmitted(String(current.input.query || ""));
       setSubject(String(current.input.subject_id || ""));
       setSelected((current.input.book_ids || []) as string[]);
       setMode(String(current.input.mode || "hybrid"));
@@ -66,6 +88,8 @@ export default function Search({
         className="search-form stack"
         onSubmit={async (e) => {
           e.preventDefault();
+          if (!query.trim()) return;
+          setSubmitted(query.trim());
           setBusy(true);
           setJob(null);
           setResults(null);
@@ -74,7 +98,8 @@ export default function Search({
               | SearchHit[]
               | { results?: SearchHit[]; hits?: SearchHit[]; job?: Job }
             >("/search", {
-              query,
+              query: query.trim(),
+              node_id: node || undefined,
               subject_id: subject || undefined,
               book_ids: selected,
               mode,
@@ -114,7 +139,7 @@ export default function Search({
             {job && isActiveJob(job) ? "检索处理中" : "检索"}
           </Button>
         </div>
-        <div className="form-grid three">
+        <div className="form-grid">
           <Field label="科目">
             <select
               value={subject}
@@ -131,33 +156,30 @@ export default function Search({
               ))}
             </select>
           </Field>
-          <Field label="检索方式">
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
-              <option value="hybrid">结构与混合检索</option>
-              <option value="keyword">关键词检索</option>
-              <option value="phrase">连续原文检索</option>
-              <option value="semantic">语义检索</option>
-            </select>
-          </Field>
-          {["hybrid", "keyword"].includes(mode) && (
-            <Field label="关键词匹配">
-              <select
-                value={keyword}
-                onChange={(e) => setKeyword(e.target.value)}
-              >
-                <option value="any">包含任意关键词</option>
-                <option value="all">包含全部关键词</option>
-              </select>
-            </Field>
-          )}
         </div>
         <details>
           <summary>
-            限定教材范围{selected.length ? ` · ${selected.length} 本` : ""}
+            限定教材范围
+            {selected.length ? ` · 已选 ${selected.length} 本` : " · 默认全部"}
           </summary>
+          <div className="inline-actions">
+            <input
+              aria-label="筛选教材"
+              placeholder="按书名筛选…"
+              value={bookQuery}
+              onChange={(event) => setBookQuery(event.target.value)}
+            />
+            <Button disabled={!selected.length} onClick={() => setSelected([])}>
+              清空选择
+            </Button>
+          </div>
           <div className="book-choices">
             {books
-              .filter((b) => !subject || b.subject_id === subject)
+              .filter(
+                (b) =>
+                  (!subject || b.subject_id === subject) &&
+                  b.title.toLowerCase().includes(bookQuery.toLowerCase()),
+              )
               .map((book) => (
                 <Check
                   key={book.id}
@@ -173,6 +195,68 @@ export default function Search({
                 />
               ))}
           </div>
+          {selected.length === 1 && (
+            <Field label="限定目录（包含全部下级内容）">
+              <select
+                disabled={nodes.loading}
+                value={node}
+                onChange={(event) => setNode(event.target.value)}
+              >
+                <option value="">整本教材</option>
+                {nodes.data.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {nodeLabel(item.id)}
+                  </option>
+                ))}
+              </select>
+              {nodes.error && (
+                <small role="alert">目录读取失败：{nodes.error}</small>
+              )}
+            </Field>
+          )}
+          <p className="hint">
+            不选教材时检索所选科目的全部教材。选择一本后可进一步限定任意目录及其子树。
+          </p>
+        </details>
+        <details>
+          <summary>
+            检索方式 ·{" "}
+            {
+              (
+                {
+                  hybrid: "结构与混合",
+                  keyword: "关键词",
+                  phrase: "连续原文",
+                  semantic: "语义",
+                } as Record<string, string>
+              )[mode]
+            }
+          </summary>
+          <div className="form-grid">
+            {" "}
+            <Field label="检索方式">
+              <select value={mode} onChange={(e) => setMode(e.target.value)}>
+                <option value="hybrid">结构与混合检索</option>
+                <option value="keyword">关键词检索</option>
+                <option value="phrase">连续原文检索</option>
+                <option value="semantic">语义检索</option>
+              </select>
+            </Field>
+            {["hybrid", "keyword"].includes(mode) && (
+              <Field label="关键词匹配">
+                <select
+                  value={keyword}
+                  onChange={(e) => setKeyword(e.target.value)}
+                >
+                  <option value="any">包含任意关键词</option>
+                  <option value="all">包含全部关键词</option>
+                </select>
+              </Field>
+            )}
+          </div>
+          <p className="hint">
+            混合检索结合目录、关键词和向量；连续原文按完整短语查找。语义检索需要先配置嵌入模型并建立教材索引。
+          </p>
         </details>
       </form>
       {tasks.error && (
@@ -186,7 +270,9 @@ export default function Search({
       )}
       {results && (
         <div className="search-results">
-          <div className="list-label">找到 {results.length} 条相关内容</div>
+          <div className="list-label">
+            “{submitted}” · {results.length} 条相关内容
+          </div>
           {!results.length && (
             <div className="empty">
               没有找到相关内容。可以调整词语、检索方式或教材范围。

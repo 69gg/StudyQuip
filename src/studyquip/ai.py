@@ -28,6 +28,7 @@ from studyquip.scheduling import (
     parse_retry_after,
     retry_delay,
 )
+from studyquip.streaming import StreamInterrupted, StreamProgress, stream_response
 
 if TYPE_CHECKING:
     from studyquip.db import Database
@@ -37,13 +38,23 @@ SaveState = Callable[[Json], Awaitable[None]]
 BeforeRequest = Callable[[], Awaitable[None]]
 ToolHandler = Callable[[Json], Awaitable[Any]]
 ResultModel = TypeVar("ResultModel", bound=BaseModel)
-ModelRole = Literal["book_vision", "book_text", "question_vision", "question_text", "embedding"]
+ModelRole = Literal[
+    "book_vision",
+    "book_text",
+    "question_vision",
+    "question_text",
+    "embedding",
+    "speech_recognition",
+    "speech_synthesis",
+]
 MODEL_ROLE_LABELS: dict[ModelRole, str] = {
     "book_vision": "教材图片模型",
     "book_text": "教材文本模型",
     "question_vision": "题目图片模型",
     "question_text": "题目文本模型",
     "embedding": "向量嵌入模型",
+    "speech_recognition": "语音识别模型",
+    "speech_synthesis": "语音合成模型",
 }
 LEGACY_MODEL_ROLES: dict[str, tuple[ModelRole, ModelRole]] = {
     "vision": ("book_vision", "question_vision"),
@@ -68,6 +79,11 @@ class ModelProfile(BaseModel):
     max_output_tokens: int | None = Field(default=None, gt=0)
     max_tokens_field: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     context_tokens: int | None = Field(default=None, ge=1024)
+    stream: bool = True
+    stream_include_usage: bool = True
+    voice: str = ""
+    audio_language: str | None = None
+    audio_speed: float | None = Field(default=None, gt=0)
     image_tokens: int = Field(default=2048, gt=0)
     timeout_seconds: float = Field(default=180, gt=0)
     retries: int = Field(default=2, ge=0, le=10)
@@ -117,6 +133,7 @@ class ModelProfile(BaseModel):
             "tools",
             "tool_choice",
             "stream",
+            "stream_options",
             "store",
             "include",
             "previous_response_id",
@@ -132,6 +149,11 @@ class ModelProfile(BaseModel):
             "reasoning_effort",
             "temperature",
             "top_p",
+            "file",
+            "voice",
+            "response_format",
+            "speed",
+            "language",
         }
         overlap = reserved.intersection(self.extra_body)
         if overlap:
@@ -366,10 +388,15 @@ class AIService:
                 "credential_max_concurrency",
                 "windows",
                 "timezone",
+                "stream",
+                "stream_include_usage",
             },
         )
         # Product routing does not alter the wire protocol. Preserve old checkpoint fingerprints
         # when the only change is copying a legacy profile into book/question roles.
+        if profile.role not in {"speech_recognition", "speech_synthesis"}:
+            for field in ("voice", "audio_language", "audio_speed"):
+                fields.pop(field, None)
         for legacy, roles in LEGACY_MODEL_ROLES.items():
             if profile.role in roles:
                 fields["role"] = legacy
@@ -416,6 +443,8 @@ class AIService:
                         "credential_max_concurrency",
                         "windows",
                         "timezone",
+                        "stream",
+                        "stream_include_usage",
                     )
                 }
             )
@@ -454,12 +483,36 @@ class AIService:
                     async with AsyncOpenAI(**client_args) as client:
                         if operation == "embedding":
                             response = await client.embeddings.create(**params)
+                        elif operation == "speech_recognition":
+                            response = await client.audio.transcriptions.create(**params)
+                        elif operation == "speech_synthesis":
+                            response = await client.audio.speech.create(**params)
+                            return {"audio": response.content}
+                        elif runtime.stream:
+
+                            async def report(value: Json) -> None:
+                                if activity:
+                                    await activity({**value, "attempt": attempt + 1})
+
+                            return await stream_response(
+                                client,
+                                profile.protocol,
+                                params,
+                                StreamProgress(report, self.settings.stream_progress_interval_seconds),
+                                runtime.stream_include_usage,
+                            )
                         elif profile.protocol == "chat":
                             response = await client.chat.completions.create(**params)
                         else:
                             response = await client.responses.create(**params)
                     return response.model_dump(mode="json", exclude_none=True)
-            except (APIConnectionError, APITimeoutError, APIStatusError) as error:
+            except (
+                APIConnectionError,
+                APITimeoutError,
+                APIStatusError,
+                httpx.TransportError,
+                StreamInterrupted,
+            ) as error:
                 transient = (
                     not isinstance(error, APIStatusError)
                     or error.status_code in {408, 409, 429}
@@ -472,6 +525,8 @@ class AIService:
                     if isinstance(body, dict) and isinstance(body.get("error"), dict):
                         body = body["error"]
                     detail = str(body.get("message", "")) if isinstance(body, dict) else ""
+                    if isinstance(error, StreamInterrupted):
+                        detail = str(error)
                     if profile.api_key:
                         detail = detail.replace(profile.api_key, "[已隐藏凭据]")
                     raise AIProtocolError(
@@ -781,6 +836,42 @@ class AIService:
                 transcript.append({"role": "user", "content": detail})
                 state["format_errors"] = [detail]
             await persist()
+
+    async def audio(
+        self,
+        profile: ModelProfile,
+        *,
+        text: str = "",
+        file: tuple[str, bytes, str] | None = None,
+        before_request: BeforeRequest | None = None,
+        bypass_window: bool = False,
+        activity: SaveState | None = None,
+    ) -> Json:
+        params: Json = {"model": profile.model}
+        if profile.role == "speech_recognition":
+            if file is None:
+                raise ValueError("语音识别需要音频文件")
+            params.update(file=file, response_format="json")
+            if profile.audio_language:
+                params["language"] = profile.audio_language
+        elif profile.role == "speech_synthesis":
+            if not text.strip() or not profile.voice.strip():
+                raise ValueError("语音合成需要文稿和已配置的音色")
+            params.update(input=text, voice=profile.voice, response_format="mp3")
+            if profile.audio_speed is not None:
+                params["speed"] = profile.audio_speed
+        else:
+            raise ValueError("此模型用途不是音频处理")
+        if profile.extra_body:
+            params["extra_body"] = profile.extra_body
+        return await self._request(
+            profile,
+            profile.role,
+            params,
+            before_request=before_request,
+            bypass_window=bypass_window,
+            activity=activity,
+        )
 
     async def embed(
         self,

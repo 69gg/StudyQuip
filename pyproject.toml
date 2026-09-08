@@ -25,6 +25,7 @@ dependencies = [
   "argon2-cffi>=23.1",
   "typer>=0.15",
   "tzdata>=2025.1",
+  "defusedxml>=0.7.1",
 ]
 
 [project.scripts]

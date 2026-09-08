@@ -875,6 +875,128 @@ small,
   padding: 23px 0 27px;
   border-bottom: 1px solid var(--line);
 }
+.question-content .question-content {
+  margin-left: 0;
+  border-bottom: 0;
+}
+.question-navigation {
+  padding: 16px 0;
+  border-block: 1px solid var(--line);
+  margin: 12px 0 24px;
+}
+.question-navigation > .inline-actions {
+  margin-top: 12px;
+}
+.part-links {
+  display: grid;
+  gap: 4px;
+  margin-top: 14px;
+}
+.part-links button {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  text-align: left;
+  background: none;
+  color: var(--text);
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 10px;
+}
+.part-links button > span:nth-child(2) {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.part-links small {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.materials-editor,
+.material-editor {
+  padding-block: 12px;
+}
+.material-editor {
+  border-top: 1px solid var(--line);
+}
+audio {
+  width: 100%;
+  max-width: 520px;
+}
+.question-material {
+  margin-block: 12px;
+}
+.question-material:empty {
+  display: none;
+}
+.rendered-figure {
+  margin: 16px 0;
+  break-inside: avoid;
+}
+.rendered-figure figcaption {
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+.coordinate-plot {
+  width: 100%;
+  max-width: 560px;
+  height: auto;
+  display: block;
+  margin: auto;
+}
+.stream-progress {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.settings-tabs {
+  display: flex;
+  gap: 28px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 24px;
+}
+.settings-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  padding: 12px 0;
+  color: var(--muted);
+  cursor: pointer;
+}
+.settings-tabs button[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.model-purpose-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.missing-model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-block: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.subject-list > button {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  border: 1px solid var(--line);
+  color: var(--text);
+  background: var(--surface);
+  padding: 12px 16px;
+  cursor: pointer;
+}
+.subject-list small {
+  color: var(--muted);
+}
 .question-number {
   font-weight: 700;
   margin-bottom: 7px;
@@ -1553,6 +1675,94 @@ details > .stack {
   orphans: 3;
   widows: 3;
 }
+.print-document .question-number {
+  display: inline;
+  float: left;
+  margin: 0 7px 0 0;
+  font-size: inherit;
+}
+.print-document .question-prompt > .rich-text:first-of-type {
+  display: flow-root;
+}
+.print-document .question-content {
+  padding-block: 3mm;
+}
+.print-document .composite-question {
+  border-bottom: 0;
+}
+.print-document .composite-question > .question-prompt {
+  break-inside: auto;
+}
+.print-document .question-material {
+  margin: 2mm 0;
+}
+.print-document .options-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2mm 8mm;
+  margin-top: 1mm;
+}
+.print-document .options-preview > div {
+  flex: 0 1 auto;
+}
+.print-document .options-preview p {
+  margin: 0;
+}
+.print-document .answer-lines {
+  margin-top: 2mm;
+}
+.print-document .answer-lines > div {
+  height: 7mm;
+}
+.print-document .rendered-figure {
+  margin: 2mm 0;
+}
+.print-document .coordinate-plot {
+  max-width: 110mm;
+}
+.print-document .rendered-figure .question-figure {
+  max-width: 110mm;
+  max-height: 60mm;
+}
+.print-review {
+  line-height: 1.6;
+}
+.print-review .answer-section {
+  display: flex;
+  align-items: baseline;
+  gap: 3mm;
+}
+.print-review .answer-section h4 {
+  flex-shrink: 0;
+}
+.print-review .answer-section p,
+.print-review .explanation p {
+  margin: 1mm 0;
+}
+.print-review .value-list > div + div {
+  margin-top: 1mm;
+}
+.print-document .answer-section {
+  margin-top: 3mm;
+}
+.print-document .answer-section h4,
+.print-document .explanation h4 {
+  margin-bottom: 1mm;
+  color: #333;
+}
+.print-document .explanation {
+  margin-top: 3mm;
+}
+.print-document .explanation > section + section {
+  margin-top: 3mm;
+}
+.print-practice .question-content {
+  border: 0;
+  padding-block: 2.5mm;
+}
+.print-practice .leaf-question {
+  break-inside: avoid-page;
+}
 @media (min-width: 1500px) {
   .workspace {
     padding-inline: 65px;
@@ -1788,14 +1998,21 @@ details > .stack {
     border-top: 1px solid var(--line);
   }
   .editor-footer {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
     padding: 13px 18px calc(13px + env(safe-area-inset-bottom));
     margin: 25px -18px -24px;
     bottom: 0;
   }
   .editor-footer .inline-actions {
+    display: contents;
     gap: 6px;
   }
   .editor-footer .button {
+    width: 100%;
+    min-width: 0;
+    white-space: normal;
     font-size: 12px;
     padding-inline: 10px;
   }

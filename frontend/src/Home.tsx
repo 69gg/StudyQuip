@@ -1,3 +1,4 @@
+import { questionTitle } from "./types";
 import { useCallback, useEffect } from "react";
 import { ArrowRight, BookOpen, Plus, RefreshCw } from "lucide-react";
 import { MathText } from "./Content";
@@ -193,7 +194,9 @@ export default function Home({
                         </time>
                       </div>
                       <MathText
-                        text={question.stem || "题目草稿（尚未填写题干）"}
+                        text={
+                          questionTitle(question) || "题目草稿（尚未填写题干）"
+                        }
                         className="home-question-preview"
                       />
                       <div className="home-question-footer">

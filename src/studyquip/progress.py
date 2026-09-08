@@ -81,6 +81,15 @@ class JobProgress:
                 active.append({**state["activity"], "page": page, "rounds": state.get("rounds", 0)})
         usage.update(checkpoint.get("embedding_usage", {}))
         usage.update(checkpoint.get("query_embedding_usage", {}))
+        for result in checkpoint.get("audio_results", {}).values():
+            measured = result.get("usage", {})
+            usage.update(
+                {
+                    "requests": 1,
+                    "input_tokens": measured.get("input_tokens", 0),
+                    "output_tokens": measured.get("output_tokens", 0),
+                }
+            )
         if not usage and isinstance(job.get("result"), dict) and job["result"].get("usage"):
             measured = job["result"]["usage"]
             usage.update(
@@ -105,6 +114,8 @@ class JobProgress:
         }
         if checkpoint.get("embedding_activity"):
             progress["embedding_activity"] = checkpoint["embedding_activity"]
+        if checkpoint.get("audio_activity"):
+            progress["active_requests"].append(checkpoint["audio_activity"])
         recovering = job["status"] == "running" and (job.get("lease_until") or 0) <= self.now
         resumable = job["status"] in RESUMABLE_STATUSES
         resume_problem = JobStore(self.db).resume_problem(job, self.conn) if resumable else None
@@ -112,6 +123,7 @@ class JobProgress:
             stages
             or checkpoint.get("completed_units")
             or checkpoint.get("embedding_completed")
+            or checkpoint.get("audio_results")
             or (job["kind"] == "book_process" and book.get("total_pages"))
         )
         return {

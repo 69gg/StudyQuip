@@ -199,7 +199,7 @@ async def verify() -> dict[str, Any]:
             await page.goto("http://studyquip.test/#questions?question=question")
             await expect(page.get_by_role("button", name="题目处理中", exact=True)).to_be_disabled()
             await expect(page.get_by_role("button", name="已有处理任务", exact=True)).to_be_disabled()
-            await expect(page.get_by_text("公式需要核对", exact=True)).to_be_visible()
+            await expect(page.get_by_text("表述需要核对", exact=True)).to_be_visible()
             await expect(page.get_by_text(question["formatting_warnings"][0], exact=True)).to_be_visible()
             await page.get_by_role("button", name="预览", exact=True).click()
             await expect(page.locator(".question-prompt .katex")).to_be_visible()
@@ -210,10 +210,23 @@ async def verify() -> dict[str, Any]:
             await page.screenshot(path=str(output / "question-formulas-desktop-dark.png"), full_page=True)
             await page.set_viewport_size({"width": 390, "height": 844})
             await page.goto("http://studyquip.test/#settings")
-            await expect(page.get_by_role("button", name="测试已安排", exact=True)).to_be_disabled()
-            for label in MODEL_ROLE_LABELS.values():
-                await expect(page.locator(".record-meta").get_by_text(label, exact=True)).to_be_visible()
+            for group, roles in {
+                "题目": ("question_vision", "question_text"),
+                "教材": ("book_vision", "book_text"),
+                "检索": ("embedding",),
+                "听力": ("speech_recognition", "speech_synthesis"),
+            }.items():
+                await (
+                    page.locator(".model-purpose-tabs").get_by_role("button", name=group, exact=True).click()
+                )
+                for role in roles:
+                    await expect(
+                        page.locator(".record-meta").get_by_text(MODEL_ROLE_LABELS[role], exact=True)
+                    ).to_be_visible()
+                if group == "检索":
+                    await expect(page.get_by_role("button", name="测试已安排", exact=True)).to_be_disabled()
             await page.screenshot(path=str(output / "models-mobile-dark.png"), full_page=True)
+            await page.locator(".model-purpose-tabs").get_by_role("button", name="教材", exact=True).click()
             await (
                 page.locator(".model-row")
                 .filter(has=page.locator(".record-meta").get_by_text("教材文本模型", exact=True))

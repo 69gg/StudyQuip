@@ -26,7 +26,7 @@
 
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 
-`ai.ModelRole` 为 `book_vision|book_text|question_vision|question_text|embedding`。`AIService.profile_for(role=None,explicit_id=None)` 必须指定用途或 ID；连接测试使用 ID，其余生成按用途读取。教材草稿用 `book_vision`，修订、概述和建议用 `book_text`；题目有题图或参考图时用 `question_vision`，纯文字提取及讲解用 `question_text`；索引及查询向量共用 `embedding`。当前 API 新增配置默认 `question_text`，不再接受旧用途作为新配置。
+`ai.ModelRole` 为 `book_vision|book_text|question_vision|question_text|embedding|speech_recognition|speech_synthesis`。`AIService.profile_for(role=None,explicit_id=None)` 必须指定用途或 ID；连接测试使用 ID，其余生成按用途读取。教材草稿用 `book_vision`，修订、概述和建议用 `book_text`；题目有题图或参考图时用 `question_vision`，纯文字提取及讲解用 `question_text`；索引及查询向量共用 `embedding`。当前 API 新增配置默认 `question_text`，不再接受旧用途作为新配置。
 
 `ai.split_legacy_model_roles(db)->int` 由 Web lifespan 和 `Worker.run()` 在服务请求／认领任务前调用，返回转换的旧记录数。旧 `vision` 原 ID 改为 `book_vision` 并复制 `question_vision`；旧 `chat` 原 ID 改为 `book_text` 并复制 `question_text`。复制 ID 使用 `uuid5(NAMESPACE_URL,"studyquip:model:{source_id}:{role}")`；字段完整继承，嵌入不变。同一短写事务重新检测旧用途并提交全部改动，不引入新表或付费请求。已转换记录后续不会再次填充，已有复制记录不覆盖。绑定 HMAC 将新的图片／文本用途映射回旧分类保持兼容，只有拆分用途时不清掉未完成工具链。凭据与模型桶的身份定义保持独立于用途。
 
@@ -88,3 +88,14 @@ GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/export
 前端 `JobsProvider` 在工作台路由外共享状态，写操作通过 `studyquip:jobs-changed` 通知立即合并任务并刷新；轮询间隔集中为 3000 ms。处理按钮在加载／错误／已有活动任务时禁用；任务结束通知对应页面刷新已提交结果，原页编辑保留未保存文本与基础版本。检索从 `input` 和 `result.hits` 恢复。模型记录携带 `revision`，热重载在处理单元／请求边界实施，协议见 ai-runtime.md。
 
 前端 `roleLabels/roleDescriptions` 定义五种用途及职责，模型列表、用途选择和字段说明复用；首页的题目录入引导检查 `question_vision/question_text`，仅配置教材用途不视为题目模型已就绪。
+
+
+## 递归题目与科目扩展
+
+题目保持单个 `records(kind=question)` JSON 和根 revision，不新增业务表；`parts` 递归包含同结构节点，type 为 composite 或现有四种基础题型，不配置固定嵌套层数。大题可无题干，必须至少一个小题；叶题仍执行原字段与答案约束。root subject_id/book_ids 约束整题，root answer_confirmed 表示全部答案经用户确认。节点／材料 ID 在整题唯一。`QuestionInput` 只接受可编辑字段，更新按子题 ID 合并并保留服务端解析；比较规范化编辑投影避免一次普通保存误丢结果或撤销答案确认。只改备注／错因不撤销答案确认，相关内容变更使解析过期。
+
+`materials` 包括 id、kind(text|listening)、可空 title、text、audio_asset_id、audio_generated_from；听力在确认时至少文稿／音频一项。`POST /api/questions/{id}/audio` 接受 ScheduleInput，生成 question_audio 持久任务。题目 API 投影 `audio_pending_roles`，Web 保存后有相应模型时自动安排缺失项；手动补全可预约，两个都已提供时不调用。材料音频引用、所有层级图片引用必须指向已有相应 MIME 的附件。音频支持 WAV、MP3、M4A/MP4、Ogg/Opus、FLAC、WebM 容器头，浏览器播放能力依格式而定。
+
+`subjects.ensure_default_subjects` 在 Web／worker 启动时执行短事务。默认列表配置 `default_subjects`；NFC＋strip 同名复用 ID，以 app_state 中的预设名称→ID 标记避免重命名后重建旧名。`POST /api/subjects` 同名返回原科目；`PUT /api/subjects/{id}` 带 name/revision，保持 ID，撞名拒绝而不合并题目或教材。
+
+导出递归检查所有基础题答案与讲解有效性，快照保留完整树。签名附件权限递归包含子题配图；当前 API 投影与历史快照分开，不改写旧引用。Print/QuestionContent 共享多级题号、材料、SVG/plot 与上传插图，练习隐藏答案、解析、听力文稿，仅简答题按 blank_lines 留白；复习展示选择的解析、错因和教材路径。等待字体、图片解码、KaTeX 和图形渲染错误检测后才生成 PDF。

@@ -24,6 +24,7 @@ from studyquip.ai import (
 )
 from studyquip.db import ConflictError, Database
 from studyquip.jobs import JobStore, source_fingerprint
+from studyquip.question_tree import FigureSpec, Material, walk_questions
 
 Json = dict[str, Any]
 
@@ -68,15 +69,21 @@ class QuestionFormattingIssue(Structured):
 
 
 class QuestionDraft(Structured):
+    id: str | None = None
     subject_id: str | None = None
-    type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer"]
-    stem: str
+    type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer", "composite"]
+    stem: str = ""
     options: ModelList[Option] = Field(default_factory=list)
     answer_from_reference: str | ModelList[str] | None = None
     wrong_answer: str | None = None
     reference_analysis: str | None = None
     # Cached results from before formula formatting must not rewrite existing text.
     formatting_issues: ModelList[QuestionFormattingIssue] | None = None
+    parts: ModelList["QuestionDraft"] = Field(default_factory=list)
+    materials: ModelList[Material] = Field(default_factory=list)
+    rendered_figures: ModelList[FigureSpec] = Field(default_factory=list)
+    figure_requirements: ModelList[str] = Field(default_factory=list)
+    figure_description: str = ""
 
 
 class EvidenceDraft(Structured):
@@ -431,14 +438,80 @@ def question_text_fields(question: Json, draft: QuestionDraft) -> Json:
     return {"stem": stem, "options": options, "formatting_warnings": warnings}
 
 
+def merge_question_draft(question: Json, draft: QuestionDraft, has_reference: bool) -> Json:
+    updated = {**question, **question_text_fields(question, draft)}
+    for field in ("subject_id", "type", "wrong_answer"):
+        value = getattr(draft, field)
+        if not updated.get(field) and value is not None:
+            updated[field] = value
+    if has_reference:
+        updated["reference_analysis"] = draft.reference_analysis
+        if (
+            not question.get("answer_confirmed")
+            and not question.get("answer")
+            and draft.answer_from_reference is not None
+        ):
+            updated.update(answer=draft.answer_from_reference, answer_source="reference")
+    if not question.get("rendered_figures"):
+        updated["rendered_figures"] = [
+            {**figure.model_dump(), "id": str(uuid.uuid4())} for figure in draft.rendered_figures
+        ]
+    updated["figure_requirements"] = draft.figure_requirements
+    updated["figure_description"] = draft.figure_description
+    if not question.get("materials"):
+        updated["materials"] = [
+            {**material.model_dump(), "id": str(uuid.uuid4())} for material in draft.materials
+        ]
+    existing = question.get("parts", [])
+    if existing:
+        candidates = {part.id: part for part in draft.parts}
+        if set(candidates) != {part["id"] for part in existing} or len(candidates) != len(draft.parts):
+            updated["formatting_warnings"].append("AI 返回的小题 ID 不完整或重复，已保留原小题结构。")
+        else:
+            updated["parts"] = [
+                merge_question_draft(
+                    part,
+                    candidates[part["id"]],
+                    has_reference or bool(part.get("reference_text") or part.get("reference_asset_ids")),
+                )
+                for part in existing
+            ]
+    elif draft.parts and question.get("type") == "composite":
+        updated["parts"] = [
+            merge_question_draft(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": part.type,
+                    "stem": "",
+                    "options": [],
+                    "answer": None,
+                },
+                part,
+                has_reference,
+            )
+            for part in draft.parts
+        ]
+    if updated != question:
+        updated.update(answer_confirmed=False, explanation_stale=bool(question.get("explanation")))
+    return updated
+
+
 async def question_extract(ctx: PipelineContext) -> None:
     question = await ctx.bind("question")
     has_reference = bool(question.get("reference_text") or question.get("reference_asset_ids"))
-    ids = [*question.get("asset_ids", []), *question.get("reference_asset_ids", [])]
+    ids = list(
+        dict.fromkeys(
+            identifier
+            for node in walk_questions(question)
+            for key in ("asset_ids", "figure_asset_ids", "reference_asset_ids")
+            for identifier in node.get(key, [])
+        )
+    )
     profile = await ctx.ai.profile_for("question_vision" if ids else "question_text")
     subjects = await asyncio.to_thread(ctx.db.list, "subject")
     prompt = (
-        "识别一道错题，并整理题干和选项的公式排版。已有题干和选项只允许格式规范化，不润色叙述、解题、纠错、补条件或改变数学含义；保留所有数值、变量、单位、正负号、条件及选项 ID。已有选项按原 ID 返回全部选项，不新增、删除或改变顺序；仅当全部选项内容为空且尚无答案时，可按原图重建空白占位选项。其余非空字段由用户填写，必须尊重；没有把握的缺失字段留空。标准答案只能从用户参考解析资料提取，不能用自行推理的答案填 answer_from_reference。参考图片位于题目图片之后。不得将图片批注误当题干。\n"
+        "整理错题：可以在不改变内容和题意的前提下优化题干、选项的表述，使语言清楚通顺，并规范公式排版。不得解题后改题、纠错、补条件、暗示答案或改变数学含义；保留全部数值、变量、单位、正负号、否定词、条件、选项 ID 与顺序。原表述有歧义时保留并提示核对。已有选项按原 ID 返回全部选项，不新增删除；仅当全部选项为空且尚无答案时可按原图重建。大题 type=composite，parts 可继续嵌套大题，保留已有小题 ID、顺序和层级，不丢弃材料。其余非空字段必须尊重；标准答案只能从参考解析提取，不得用自行推导的答案填 answer_from_reference。不得将图片批注误当题干。\n"
+        "你可以按需使用关键词、向量、混合检索和目录工具理解教材术语与图示，但检索不能成为修改题目条件或编造答案的依据。已有材料足够时直接提交。配图优先返回 rendered_figures：几何/实验示意图用仅含静态元素的安全 SVG；函数与坐标图用 plot 的范围、series.expression（仅 x 和常见数学函数）或 points。不能可靠复刻的复杂插图在 figure_requirements 中说明，请用户上传，不猜画。figure_description 忠实描述已有插图中的标签、数值和关系，供文本讲解模型理解，不额外解题或猜测不清晰的信息。材料 materials 的 kind 为 text 或 listening，保留用户音频 ID 和文稿；不得虚构音频附件。\n"
         r"在 stem 和 options.text 中使用 Markdown 与 KaTeX 支持的 LaTeX：行内公式用 $...$，独立公式用单独成行的 $$...$$。将含义明确的分数、根号、上下标、向量和化学式规范排版，例如 x^2/2 写为 $\frac{x^2}{2}$，sqrt(x) 写为 $\sqrt{x}$，H2SO4 写为 $\ce{H2SO4}$。化学反应使用 \ce{...}，保留原系数和反应条件，不自行配平。中文叙述放在公式外，不将全文包入公式或代码块；已正确的 LaTeX 不重复包裹。"
         "\n公式含义不明确（例如未注明分母范围的 1/2x）或图片符号不清时，不猜测：已有字段完整保留原文，空字段忠实转录可辨认内容，并在 formatting_issues 中指出位置与问题（field 为 stem 或 option，选项使用原 option_id）。formatting_issues 必须返回列表，无问题返回 []。\n"
         "做错原因 error_reason 和备注 notes 均由用户填写，题目识别不得生成或改写这两个字段。\n"
@@ -448,39 +521,50 @@ async def question_extract(ctx: PipelineContext) -> None:
                 "subjects": subjects,
                 "question_image_count": len(question.get("asset_ids", [])),
                 "has_reference": has_reference,
+                "image_manifest": [
+                    {
+                        "position": index + 1,
+                        "asset_id": identifier,
+                        "uses": [
+                            {"node_id": node.get("id"), "field": field}
+                            for node in walk_questions(question)
+                            for field in ("asset_ids", "figure_asset_ids", "reference_asset_ids")
+                            if identifier in node.get(field, [])
+                        ],
+                    }
+                    for index, identifier in enumerate(ids)
+                ],
             },
             ensure_ascii=False,
         )
     )
+    from studyquip.retrieval import RetrievalService
+
+    with ctx.db.read() as conn:
+        books = RetrievalService(ctx.db).scoped_books(
+            question.get("book_ids") or None, question.get("subject_id"), conn
+        )
     draft: QuestionDraft = await ctx.structured(
-        "question_extract", profile, prompt, QuestionDraft, await ctx.assets(ids)
+        "question_extract",
+        profile,
+        prompt,
+        QuestionDraft,
+        await ctx.assets(ids),
+        tools=retrieval_tools(ctx, books, question.get("subject_id"), context_tokens=profile.context_tokens),
     )
 
     def write(conn: Connection) -> None:
-        updated = {**question, **question_text_fields(question, draft)}
-        for field in ("subject_id", "type", "wrong_answer"):
-            value = draft.model_dump()[field]
-            if not updated.get(field) and value is not None:
-                updated[field] = value
+        updated = merge_question_draft(question, draft, has_reference)
         if updated.get("subject_id") and not ctx.db.get("subject", updated["subject_id"], conn=conn):
             raise ValueError("模型选择了不存在的科目")
-        if has_reference:
-            updated["reference_analysis"] = draft.reference_analysis
-            if (
-                not updated.get("answer_confirmed")
-                and not updated.get("answer")
-                and draft.answer_from_reference is not None
-            ):
-                updated["answer"] = draft.answer_from_reference
-                updated["answer_confirmed"] = False
-                updated["answer_source"] = "reference"
-        updated["explanation_stale"] = bool(updated.get("explanation"))
-        if (
-            updated["stem"] != question.get("stem", "")
-            or updated["options"] != question.get("options", [])
-            or updated["formatting_warnings"]
-        ):
-            updated.update(answer_confirmed=False, status="draft")
+        audio_ids = {
+            m.get("audio_asset_id") for n in walk_questions(question) for m in n.get("materials", [])
+        }
+        for node in walk_questions(updated):
+            for material in node.get("materials", []):
+                if material.get("audio_asset_id") and material["audio_asset_id"] not in audio_ids:
+                    raise ValueError("模型返回了不属于该题目的音频附件")
+        updated.update(answer_confirmed=False, status="draft")
         ctx.db.put("question", updated, id=question["id"], expected_revision=question["revision"], conn=conn)
 
     await ctx.finish({"question_id": question["id"], "requires_answer_confirmation": True}, write)
@@ -717,78 +801,210 @@ async def question_explain(ctx: PipelineContext) -> None:
 
     question = await ctx.bind("question")
     validate_question(question, require_confirmed=True)
-    if not question.get("answer_confirmed") or question.get("answer") in (None, "", []):
-        raise NeedsReview("请先确认正确答案")
+    if any(
+        material.get("kind") == "listening" and not material.get("text", "").strip()
+        for node in walk_questions(question)
+        for material in node.get("materials", [])
+    ):
+        raise NeedsReview("听力录音尚无文稿；请配置语音识别模型并补全文稿，或手动填写后生成讲解")
     profile = await ctx.ai.profile_for("question_text")
-    retrieval = RetrievalService(ctx.db)
     with ctx.db.read() as conn:
-        book_ids = retrieval.scoped_books(question.get("book_ids") or None, question.get("subject_id"), conn)
-    tools = retrieval_tools(ctx, book_ids, question.get("subject_id"), context_tokens=profile.context_tokens)
-    initial = (
-        await tools["search_textbook"][2]({"query": question["stem"], "mode": "hybrid"}) if book_ids else []
-    )
-    optimize_error_reason = bool(
-        question.get("optimize_error_reason", False) and question.get("error_reason", "").strip()
-    )
-    prompt = (
-        "为这道已确认答案的错题生成讲解、分步分析和知识点。标准答案由用户确认，不得替换；发现冲突填写 answer_conflict 并说明。优先使用参考解析和教材证据，引用只显示书名及实际目录路径，不显示教材页码。没有命中原文时 citations 留空。必须使用引文原文、块 ID 和当前 revision。\n"
-        "error_reason 是用户自述的做错原因，原文和备注不可改写。仅当 error_reason_optimization_enabled "
-        "为 true 时，在 error_reason_optimized 中优化其用词与条理，保留原意、第一人称和不确定程度；"
-        "不得从题目、答案或教材推断、补充用户没有写出的错因。为 false 时该字段必须为 null。\n"
-        + json.dumps(
-            {
-                "question": question,
-                "initial_evidence": initial,
-                "allowed_book_ids": book_ids,
-                "error_reason_optimization_enabled": optimize_error_reason,
-            },
-            ensure_ascii=False,
+        book_ids = RetrievalService(ctx.db).scoped_books(
+            question.get("book_ids") or None, question.get("subject_id"), conn
         )
+    tools = retrieval_tools(ctx, book_ids, question.get("subject_id"), context_tokens=profile.context_tokens)
+    targets: list[tuple[Json, list[Json]]] = []
+    stack: list[tuple[Json, list[Json]]] = [(question, [])]
+    while stack:
+        node, ancestors = stack.pop()
+        if node.get("type") != "composite" or (
+            node.get("optimize_error_reason") and node.get("error_reason", "").strip()
+        ):
+            targets.append((node, ancestors))
+        context = {key: node.get(key) for key in ("id", "stem", "materials", "reference_text", "notes")}
+        stack.extend((part, [*ancestors, context]) for part in reversed(node.get("parts", [])))
+
+    async def explain(node: Json, ancestors: list[Json]) -> tuple[str, ExplanationDraft, bool]:
+        optimize = bool(node.get("optimize_error_reason") and node.get("error_reason", "").strip())
+        initial = (
+            await tools["search_textbook"][2]({"query": node.get("stem", ""), "mode": "hybrid"})
+            if book_ids
+            else []
+        )
+        prompt = (
+            "为这道已确认答案的错题生成讲解、分步分析和知识点。结合祖先大题的题干和材料理解当前小题；"
+            "标准答案由用户确认，不得替换，冲突写入 answer_conflict。可自行调用关键词、向量、混合检索、目录及正文工具寻找依据。"
+            "优先使用参考解析和教材证据，引用只显示书名及实际目录路径，不显示教材页码。"
+            "没有命中原文时 citations 留空；引文必须包含原文、块 ID 和当前 revision。不要臆测无法看到的插图。\n"
+            "error_reason 是用户自述的做错原因，原文和备注不可改写。仅当 error_reason_optimization_enabled "
+            "为 true 时，在 error_reason_optimized 中优化其用词与条理，保留原意、第一人称和不确定程度；"
+            "不得从题目、答案或教材推断、补充用户没有写出的错因。为 false 时该字段必须为 null。\n"
+            + json.dumps(
+                {
+                    "question": node,
+                    "ancestor_materials": ancestors,
+                    "initial_evidence": initial,
+                    "allowed_book_ids": book_ids,
+                    "error_reason_optimization_enabled": optimize,
+                },
+                ensure_ascii=False,
+            )
+        )
+        key = "question_explain" if node["id"] == question["id"] else f"question_explain:{node['id']}"
+        draft = await ctx.structured(
+            key, profile, prompt, OptimizedExplanationDraft if optimize else ExplanationDraft, tools=tools
+        )
+        return node["id"], draft, optimize
+
+    # The request scheduler applies the configured model/credential limits to independent leaves.
+    outputs = await asyncio.gather(
+        *(explain(node, ancestors) for node, ancestors in targets), return_exceptions=True
     )
-    draft: ExplanationDraft = await ctx.structured(
-        "question_explain",
-        profile,
-        prompt,
-        OptimizedExplanationDraft if optimize_error_reason else ExplanationDraft,
-        tools=tools,
-    )
+    results: list[tuple[str, ExplanationDraft, bool]] = []
+    for output in outputs:
+        if isinstance(output, BaseException):
+            raise output
+        results.append(output)
     service = TextbookService(ctx.db)
 
     def write(conn: Connection) -> None:
-        citations: list[Json] = []
-        for citation in draft.citations:
-            block = ctx.db.get("block", citation.block_id, conn=conn)
-            if not block or block.get("book_id") not in book_ids:
-                raise ValueError("讲解引文超出所选教材范围")
-            hint = (
-                (citation.start, citation.end)
-                if citation.start is not None and citation.end is not None
-                else None
-            )
-            evidence = service.current_evidence(
-                block["book_id"], citation.block_id, citation.revision, citation.quote, hint, conn=conn
-            )
-            book = ctx.db.get("book", block["book_id"], conn=conn) or {}
-            citations.append(
-                {
-                    **evidence,
-                    "book_id": block["book_id"],
-                    "book_title": book.get("title", ""),
-                    "node_path": node_path(ctx.db, block.get("node_id"), conn=conn),
-                }
-            )
-        explanation = {**draft.model_dump(), "citations": citations, "has_textbook_evidence": bool(citations)}
-        if not optimize_error_reason:
-            explanation["error_reason_optimized"] = None
-        ctx.db.put(
-            "question",
-            {**question, "explanation": explanation, "explanation_stale": False, "status": "ready"},
-            id=question["id"],
-            expected_revision=question["revision"],
-            conn=conn,
+        updated = copy.deepcopy(question)
+        nodes = {node["id"]: node for node in walk_questions(updated)}
+        for identifier, draft, optimize in results:
+            citations: list[Json] = []
+            for citation in draft.citations:
+                block = ctx.db.get("block", citation.block_id, conn=conn)
+                if not block or block.get("book_id") not in book_ids:
+                    raise ValueError("讲解引文超出所选教材范围")
+                hint = (
+                    (citation.start, citation.end)
+                    if citation.start is not None and citation.end is not None
+                    else None
+                )
+                evidence = service.current_evidence(
+                    block["book_id"], citation.block_id, citation.revision, citation.quote, hint, conn=conn
+                )
+                book = ctx.db.get("book", block["book_id"], conn=conn) or {}
+                citations.append(
+                    {
+                        **evidence,
+                        "book_id": block["book_id"],
+                        "book_title": book.get("title", ""),
+                        "node_path": node_path(ctx.db, block.get("node_id"), conn=conn),
+                    }
+                )
+            explanation = {
+                **draft.model_dump(),
+                "citations": citations,
+                "has_textbook_evidence": bool(citations),
+            }
+            if not optimize:
+                explanation["error_reason_optimized"] = None
+            nodes[identifier].update(explanation=explanation, explanation_stale=False)
+        updated.update(explanation_stale=False, status="ready")
+        ctx.db.put("question", updated, id=question["id"], expected_revision=question["revision"], conn=conn)
+
+    await ctx.finish({"question_id": question["id"], "explained_parts": len(results)}, write)
+
+
+async def question_audio(ctx: PipelineContext) -> None:
+    from studyquip.media import safe_path, store_upload
+    from studyquip.question_tree import audio_work
+
+    question = await ctx.bind("question")
+    completed = copy.deepcopy(ctx.data.get("audio_results", {}))
+    missing: list[str] = []
+    profiles = await ctx.ai.profiles()
+    for node, material, role in audio_work(question):
+        key = material["id"]
+        if key in completed:
+            continue
+        if not any(profile.role == role for profile in profiles):
+            missing.append(role)
+            continue
+        profile = await ctx.ai.profile_for(role)
+        await ctx.commit(
+            {
+                "phase": "补全文稿" if role == "speech_recognition" else "生成听力音频",
+                "current_material": material.get("title") or "听力材料",
+            }
         )
 
-    await ctx.finish({"question_id": question["id"]}, write)
+        async def activity(value: Json) -> None:
+            await ctx.commit(
+                {
+                    "audio_activity": {
+                        **value,
+                        "model": profile.model,
+                        "role": profile.role,
+                        "profile_id": profile.id,
+                        "revision": profile.revision,
+                    }
+                }
+            )
+
+        file: tuple[str, bytes, str] | None = None
+        if role == "speech_recognition":
+            asset = await asyncio.to_thread(ctx.db.get, "asset", material["audio_asset_id"])
+            if not asset or not asset["mime"].startswith("audio/"):
+                raise ValueError("听力音频已丢失或格式不正确")
+            content = await asyncio.to_thread(safe_path(ctx.settings, asset["path"]).read_bytes)
+            file = (asset["name"], content, asset["mime"])
+        response = await ctx.ai.audio(
+            profile,
+            text=material.get("text", ""),
+            file=file,
+            before_request=ctx.guard,
+            bypass_window=bool(ctx.job.get("bypass_window")),
+            activity=activity,
+        )
+        result: Json = {"node_id": node["id"], "usage": response.get("usage", {})}
+        generated: Json | None = None
+        if role == "speech_recognition":
+            text = response.get("text", "").strip()
+            if not text:
+                raise AIProtocolError("语音识别返回了空文稿；原音频已保留，可继续重试")
+            result["text"] = text
+        else:
+            generated = await asyncio.to_thread(
+                store_upload, ctx.settings, "听力-合成.mp3", response["audio"]
+            )
+            result.update(
+                audio_asset_id=generated["id"],
+                audio_generated_from=hashlib.sha256(material["text"].encode()).hexdigest(),
+            )
+        completed[key] = result
+
+        def publish(conn: Connection) -> None:
+            if generated:
+                ctx.db.put("asset", generated, id=generated["id"], conn=conn)
+
+        await ctx.commit({"audio_results": completed, "audio_activity": None}, publish)
+
+    def write(conn: Connection) -> None:
+        updated = copy.deepcopy(question)
+        for node in walk_questions(updated):
+            for material in node.get("materials", []):
+                result = completed.get(material["id"], {})
+                material.update(
+                    {key: value for key, value in result.items() if key not in {"node_id", "usage"}}
+                )
+        if updated != question:
+            for node in walk_questions(updated):
+                if node.get("explanation"):
+                    node["explanation_stale"] = True
+            ctx.db.put(
+                "question", updated, id=question["id"], expected_revision=question["revision"], conn=conn
+            )
+
+    await ctx.finish(
+        {
+            "question_id": question["id"],
+            "completed_materials": len(completed),
+            "missing_model_roles": list(dict.fromkeys(missing)),
+        },
+        write,
+    )
 
 
 async def _prepare_pages(ctx: PipelineContext, book: Json) -> list[Json]:
@@ -1203,6 +1419,31 @@ async def model_test(ctx: PipelineContext) -> None:
             bypass_window=bool(ctx.job.get("bypass_window")),
         )
         result: Json = {"ok": True, "dimensions": len(vectors[0]), "usage": usage}
+    elif profile.role in {"speech_recognition", "speech_synthesis"}:
+        import io
+        import wave
+
+        file: tuple[str, bytes, str] | None = None
+        if profile.role == "speech_recognition":
+            buffer = io.BytesIO()
+            with wave.open(buffer, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(b"\0" * 32000)
+            file = ("connection-test.wav", buffer.getvalue(), "audio/wav")
+        response = await ctx.ai.audio(
+            profile,
+            file=file,
+            text="This is a StudyQuip audio test.",
+            before_request=ctx.guard,
+            bypass_window=bool(ctx.job.get("bypass_window")),
+        )
+        result = {
+            "ok": True,
+            "audio_bytes": len(response.get("audio", b"")),
+            "usage": response.get("usage", {}),
+        }
     else:
         probe: Probe = await ctx.structured(
             "model_test", profile, "连接与工具调用协议测试：请调用 submit_result，参数 ok 为 true。", Probe
@@ -1560,6 +1801,7 @@ HANDLERS: dict[str, Callable[[PipelineContext], Any]] = {
     "model_test": model_test,
     "question_extract": question_extract,
     "question_explain": question_explain,
+    "question_audio": question_audio,
     "book_process": book_process,
     "page_recognize": page_recognize,
     "book_index": book_index,
