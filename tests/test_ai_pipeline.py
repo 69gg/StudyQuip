@@ -218,9 +218,11 @@ async def test_worker_startup_restores_legacy_review_pages_without_losing_text_o
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+@pytest.mark.parametrize(
+    "legacy_checkpoint,failure_kind", [(False, "network"), (True, "network"), (True, "format")]
+)
 async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
-    tmp_path: Path, legacy_checkpoint: bool
+    tmp_path: Path, legacy_checkpoint: bool, failure_kind: str
 ) -> None:
     settings = Settings(data_dir=tmp_path)
     initialize(settings)
@@ -269,11 +271,29 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         def respond(request: httpx.Request) -> httpx.Response:
             wire = json.loads(request.content)
             requests.append(wire)
-            if len(requests) == 2:
+            if len(requests) == 2 and failure_kind == "network":
                 # Interrupt after the response and read-tool result have been committed.
                 raise RuntimeError("模拟中断")
             if len(requests) == 1:
                 name, arguments = "read_block", {"block_id": first_block["id"]}
+            elif len(requests) == 2:
+                name, arguments = (
+                    "submit_result",
+                    {
+                        "operations": [
+                            {
+                                "op": "insert",
+                                "block": {
+                                    "node_id": root["id"],
+                                    "text": pages[1]["text"],
+                                    "source_page_ids": {"item": pages[1]["id"]},
+                                },
+                            }
+                        ],
+                        "reason": "无效的数组包装",
+                        "working_summary": "",
+                    },
+                )
             else:
                 if legacy_checkpoint:
                     assert wire["messages"][2:] == saved_transcript
@@ -333,12 +353,18 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         assert claimed
         await worker.execute(claimed)
         failed = jobs.get(task["id"])
-        assert failed and failed["status"] == "failed" and "模型请求失败" in failed["error"]
+        assert failed and failed["status"] == "failed"
+        assert ("已用完 0 次" if failure_kind == "format" else "模型请求失败") in failed["error"]
         checkpoint = copy.deepcopy(failed["checkpoint"])
         stage = checkpoint["stages"][f"revise:{pages[1]['id']}:1:0:0"]
-        assert stage["pending"] == [] and stage["rounds"] == 1
+        assert stage["pending"] == [] and stage["rounds"] == (2 if failure_kind == "format" else 1)
         saved_transcript = copy.deepcopy(stage["transcript"])
-        assert len(saved_transcript) == 2
+        assert len(saved_transcript) == (4 if failure_kind == "format" else 2)
+        if failure_kind == "format":
+            assert stage["format_failure"] and stage["format_rounds"] == 1
+            assert db.get("page", pages[1]["id"]) == pages[1]
+            assert len(records(db, "block", {"book_id": book["id"]})) == 1
+            configured = db.put("model", {**configured, "retries": 2}, id=configured["id"])
         if legacy_checkpoint:
             # Existing installations have these transcripts but no initial-input snapshot yet.
             stage.pop("request_context")
@@ -376,6 +402,8 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
             assert scheduled["id"] == task["id"] and scheduled["not_before"] > time.time() + 3500
             repeated = client.post(f"/api/jobs/{task['id']}/resume", json={}).json()
             assert repeated["reused"] and repeated["not_before"] == scheduled["not_before"]
+            if failure_kind == "format":
+                stage.pop("format_failure")
             assert jobs.get(task["id"])["checkpoint"] == checkpoint
             assert jobs.claim(worker.owner) is None
             assert client.post(f"/api/jobs/{task['id']}/reschedule", json={}).status_code == 200
@@ -390,7 +418,9 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         assert db.get("page", pages[1]["id"])["status"] == "processed"
         assert len(records(db, "block", {"book_id": book["id"]})) == 2
         assert len(current["checkpoint"]["completed_units"]) == 1
-        assert current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]["usage"]["requests"] == 2
+        assert current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]["usage"]["requests"] == (
+            3 if failure_kind == "format" else 2
+        )
         with pytest.raises(ConflictError, match="已结束"):
             jobs.resume(task["id"], time.time())
         # Reuse this saved input to check source fencing on a failed task, without dispatching again.

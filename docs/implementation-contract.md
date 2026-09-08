@@ -18,6 +18,10 @@
 
 `resume(id,not_before,bypass_window=False)` 复用原任务和检查点，接受失败／取消／待人工处理状态；对于已在队列、运行或等待时段的同一任务幂等返回，不改变预约和租约。`POST /api/jobs/{id}/resume` 与兼容 `/retry` 接收可选 `ScheduleInput`，修复旧重试接口忽略预约请求体的行为。`resume_problem` 与执行层共用来源指纹，恢复前拒绝互斥任务、已删除来源及输入修改，已完成任务不能恢复。无需数据库迁移。
 
+`ModelProfile.retries` 同时作为网络重试次数和每个结构化单元的格式重试次数，分别计数，默认 2、0 表示关闭。`AIService.structured` 在没有工具调用、空 choices、JSON／字段校验错误时保存反馈后自动重试，通过现有 `_request` 执行准入；`scheduling.retry_delay(attempt)` 共用指数退避。阶段新增 `format_errors`（当前回复尚待处理的校验错误）、`format_retries`（已安排次数）、`format_rounds`（格式失败回复数）、`format_retry:{attempt,limit,next_at,reason}` 和耗尽标志 `format_failure`；`rounds-format_rounds` 受正常工具轮数约束。`pending_batch_size` 保留原工具批次大小。显式恢复已结束任务只清除未完成且耗尽阶段的 `format_failure/format_retries/format_retry`，保留转录、用量和已完成结果；自动恢复不清额度。旧 `repairs` 不再触发固定一次修复限制。
+
+`RevisionDraft.operations` 通过 `op` 判别联合类型；`operation_schema` 保留发往服务商的 `anyOf` 结构。`validation_feedback` 输出字段路径、错误信息与类型，省略原始参数和错误文档链接，不把无效数组包装自动转成合法参数。活动投影另有 `format_attempt/format_limit/reason`，供现有任务界面展示。
+
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 
 `ai.ModelRole` 为 `book_vision|book_text|question_vision|question_text|embedding`。`AIService.profile_for(role=None,explicit_id=None)` 必须指定用途或 ID；连接测试使用 ID，其余生成按用途读取。教材草稿用 `book_vision`，修订、概述和建议用 `book_text`；题目有题图或参考图时用 `question_vision`，纯文字提取及讲解用 `question_text`；索引及查询向量共用 `embedding`。当前 API 新增配置默认 `question_text`，不再接受旧用途作为新配置。

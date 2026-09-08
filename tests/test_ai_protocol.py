@@ -13,6 +13,8 @@ from pydantic import BaseModel, ValidationError
 
 from studyquip.ai import AIProtocolError, AIService, ContextBudgetExceeded, ModelProfile, request_parameters
 from studyquip.config import Settings
+from studyquip.pipelines import RevisionDraft
+from studyquip.scheduling import WindowClosed
 
 
 class FakeProfiles:
@@ -384,8 +386,12 @@ async def test_unset_request_limit_resumes_large_reasoning_without_truncating(pr
 
 
 @pytest.mark.asyncio
-async def test_invalid_result_repairs_once_and_does_not_accept_free_text() -> None:
-    configured = profile()
+@pytest.mark.parametrize("retries", [0, 2])
+async def test_invalid_result_uses_configured_retries_and_persists_exhaustion(
+    retries: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studyquip.ai.retry_delay", lambda attempt: 0)
+    configured = profile(retries=retries, max_tool_rounds=1)
     count = 0
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -408,7 +414,7 @@ async def test_invalid_result_repairs_once_and_does_not_accept_free_text() -> No
                                 {
                                     "id": str(count),
                                     "type": "function",
-                                    "function": {"name": "submit_result", "arguments": "{}"},
+                                    "function": {"name": "submit_result", "arguments": "{invalid json"},
                                 }
                             ],
                         },
@@ -418,9 +424,157 @@ async def test_invalid_result_repairs_once_and_does_not_accept_free_text() -> No
         )
 
     ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
-    with pytest.raises(AIProtocolError, match="修复后仍"):
-        await ai.structured(configured, "test", Result)
-    assert count == 2
+    state: dict[str, Any] = {}
+    with pytest.raises(AIProtocolError, match=f"已用完 {retries} 次"):
+        await ai.structured(configured, "test", Result, state=state)
+    assert count == retries + 1 and state["usage"]["requests"] == count
+    assert "result" not in state and not state["pending"] and state["format_failure"]
+    # Automatic recovery cannot silently replenish an exhausted allowance.
+    with pytest.raises(AIProtocolError, match="已用完"):
+        await ai.structured(configured, "test", Result, state=copy.deepcopy(state))
+    assert count == retries + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol,store", [("chat", False), ("responses", False), ("responses", True)])
+async def test_format_retries_preserve_protocol_feedback_and_window_checkpoint(
+    protocol: str, store: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studyquip.ai.retry_delay", lambda attempt: 0)
+    configured = profile(id="editable", protocol=protocol, store=store, retries=1, max_tool_rounds=1)
+    profiles = FakeProfiles([configured])
+    requests: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    valid = {
+        "operations": [
+            {
+                "op": "insert",
+                "block": {
+                    "node_id": "node",
+                    "text": "原文",
+                    "source_page_ids": ["page"],
+                },
+            }
+        ],
+        "reason": "整理",
+        "working_summary": "摘要",
+        "concepts": [{"name": "概念", "aliases": ["别名"], "evidence": []}],
+    }
+    invalid = copy.deepcopy(valid)
+    invalid["operations"][0]["block"]["source_page_ids"] = {"item": "page"}
+    invalid["concepts"][0]["aliases"] = {"item": ["别名"]}
+    invalid["concepts"][0]["evidence"] = {"item": []}
+    with pytest.raises(ValidationError) as failure:
+        RevisionDraft.model_validate(invalid)
+    assert failure.value.error_count() == 3
+    # Keep the provider-facing schema compatible with the prior anyOf definition.
+    operation_schema = RevisionDraft.model_json_schema()["properties"]["operations"]["items"]
+    assert (
+        "anyOf" in operation_schema
+        and "oneOf" not in operation_schema
+        and "discriminator" not in operation_schema
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        requests.append(wire)
+        count = len(requests)
+        arguments = json.dumps(invalid if count == 2 else valid, ensure_ascii=False)
+        if protocol == "chat":
+            message: dict[str, Any] = {"role": "assistant", "reasoning_content": f"thinking-{count}"}
+            if count == 1:
+                message["content"] = "已整理完毕。"
+            else:
+                message["tool_calls"] = [
+                    {
+                        "id": f"call-{count}",
+                        "type": "function",
+                        "function": {"name": "submit_result", "arguments": arguments},
+                    }
+                ]
+            body = {
+                "choices": [{"finish_reason": "stop" if count == 1 else "tool_calls", "message": message}]
+            }
+        else:
+            item = (
+                {
+                    "type": "message",
+                    "id": "text-1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "已整理完毕。", "annotations": []}],
+                }
+                if count == 1
+                else {
+                    "type": "function_call",
+                    "id": f"item-{count}",
+                    "call_id": f"call-{count}",
+                    "name": "submit_result",
+                    "arguments": arguments,
+                    "status": "completed",
+                }
+            )
+            body = {
+                "id": f"response-{count}",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": f"reason-{count}",
+                        "summary": [],
+                        "encrypted_content": f"opaque-{count}",
+                    },
+                    item,
+                ],
+            }
+        body["usage"] = {"input_tokens": 10, "output_tokens": 20}
+        return httpx.Response(200, json=body)
+
+    async def save(value: dict[str, Any]) -> None:
+        snapshots.append(copy.deepcopy(value))
+
+    async def before() -> None:
+        if len(requests) == 1:
+            raise WindowClosed(12345)
+
+    ai = AIService(profiles, Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {}
+    with pytest.raises(WindowClosed):
+        await ai.structured(
+            configured, "整理原文", RevisionDraft, state=state, save=save, before_request=before
+        )
+    assert len(requests) == 1 and state["format_retry"]["attempt"] == 1
+    assert "result" not in state
+    checkpoint = json.loads(json.dumps(snapshots[-1]))
+    profiles.profiles = [configured.model_copy(update={"retries": 2, "revision": 2})]
+    result = await ai.structured(configured, "不得替换已保存原文", RevisionDraft, state=checkpoint, save=save)
+    assert result.operations[0].block.source_page_ids == ["page"]
+    assert len(requests) == 3 and checkpoint["format_retries"] == 2
+    assert checkpoint["usage"] == {"requests": 3, "input_tokens": 30, "output_tokens": 60}
+    assert checkpoint["rounds"] - checkpoint["format_rounds"] == 1
+    retry_activities = [s["activity"] for s in snapshots if s.get("activity", {}).get("state") == "retrying"]
+    assert {a["format_attempt"] for a in retry_activities} == {1, 2}
+    wire_history = requests[-1]["messages" if protocol == "chat" else "input"]
+    feedback = wire_history[-1]
+    assert feedback.get("tool_call_id", feedback.get("call_id")) == "call-2"
+    detail = feedback.get("content", feedback.get("output"))
+    assert "source_page_ids" in detail and "aliases" in detail and "evidence" in detail
+    assert "UpdateOperation" not in detail and "errors.pydantic.dev" not in detail
+    if protocol == "chat":
+        assert any(item.get("reasoning_content") == "thinking-1" for item in wire_history)
+        assert any(
+            item.get("role") == "user" and "submit_result" in str(item.get("content"))
+            for item in wire_history[2:]
+        )
+    elif store:
+        refs = [item["id"] for item in wire_history if item.get("type") == "item_reference"]
+        assert refs == ["reason-1", "text-1", "reason-2", "item-2"]
+        assert not any(item.get("type") == "reasoning" for item in wire_history)
+    else:
+        assert [item["encrypted_content"] for item in wire_history if item.get("type") == "reasoning"] == [
+            "opaque-1",
+            "opaque-2",
+        ]
 
 
 @pytest.mark.asyncio

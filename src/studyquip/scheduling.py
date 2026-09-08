@@ -37,6 +37,11 @@ class WindowClosed(Exception):
         self.reason = reason
 
 
+def retry_delay(attempt: int) -> float:
+    """Shared backoff for transport failures and invalid structured output."""
+    return min(2**attempt, 30)
+
+
 def next_allowed(now: float, windows: Iterable[Window], timezone_name: str) -> float:
     """Return now when admitted; start == end explicitly means all day."""
     configured = list(windows)

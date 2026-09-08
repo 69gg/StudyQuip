@@ -104,6 +104,9 @@ export type RequestActivity = {
   page?: number;
   rounds?: number;
   attempt?: number;
+  format_attempt?: number;
+  format_limit?: number;
+  reason?: string;
 };
 export type Model = Entity & {
   name: string;

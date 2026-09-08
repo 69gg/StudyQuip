@@ -96,7 +96,17 @@ async def verify() -> dict[str, Any]:
                 "summarized_nodes": 0,
                 "usage": {"requests": 15, "input_tokens": 20000, "output_tokens": 26000},
                 "active_requests": [
-                    {"state": "requesting", "model": "vision-fixture", "revision": 2, "page": 16, "at": now}
+                    {
+                        "state": "retrying",
+                        "model": "vision-fixture",
+                        "revision": 2,
+                        "page": 16,
+                        "at": now,
+                        "next_at": now + 2,
+                        "format_attempt": 1,
+                        "format_limit": 2,
+                        "reason": "模型没有调用结构化结果工具；已要求重新提交。",
+                    }
                 ],
                 "last_activity_at": now,
             },
@@ -182,6 +192,8 @@ async def verify() -> dict[str, Any]:
             await page.goto("http://studyquip.test/#tasks?job=book_process")
             await expect(page.get_by_text("进度验收教材", exact=True)).to_be_visible()
             await expect(page.get_by_text("原页 16 · vision-fixture", exact=False)).to_be_visible()
+            await expect(page.get_by_text("格式重试 1/2", exact=False)).to_be_visible()
+            await expect(page.get_by_text("模型没有调用结构化结果工具", exact=False)).to_be_visible()
             await page.screenshot(path=str(output / "tasks-mobile-dark.png"), full_page=True)
             assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             await page.goto("http://studyquip.test/#questions?question=question")
@@ -218,9 +230,17 @@ async def verify() -> dict[str, Any]:
             await expect(
                 page.get_by_text("顺序整理教材、衔接跨页内容、生成目录概述与修改建议。", exact=True)
             ).to_be_visible()
+            await page.get_by_text("高级参数", exact=True).click()
+            await expect(page.get_by_role("spinbutton", name="自动重试次数", exact=False)).to_have_value("2")
+            await expect(
+                page.get_by_text("网络错误和模型格式错误分别使用此次数；0 表示不自动重试。", exact=True)
+            ).to_be_visible()
             assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             await page.screenshot(path=str(output / "model-purpose-mobile-dark.png"), full_page=True)
             await page.set_viewport_size({"width": 1280, "height": 900})
+            await page.get_by_role("spinbutton", name="自动重试次数", exact=False).evaluate(
+                "element => element.scrollIntoView({block: 'center'})"
+            )
             await page.screenshot(path=str(output / "model-purpose-desktop-dark.png"), full_page=True)
             await page.get_by_role("button", name="关闭窗口", exact=True).click()
             await page.set_viewport_size({"width": 390, "height": 844})
@@ -270,6 +290,7 @@ async def verify() -> dict[str, Any]:
         "expired_lease_and_api_failure_guarded": True,
         "separate_model_purposes": list(MODEL_ROLE_LABELS),
         "question_formulas_and_review_notices": True,
+        "format_retry_progress_and_settings": True,
         "mobile_overflow": False,
         "browser_errors": errors,
     }

@@ -282,6 +282,10 @@ export function JobProgress({
                     tools: "处理工具结果",
                   } as Record<string, string>
                 )[r.state] || r.state}
+                {r.format_attempt
+                  ? ` · 格式重试 ${r.format_attempt}/${r.format_limit}`
+                  : ""}
+                {r.state === "retrying" && r.reason ? ` · ${r.reason}` : ""}
                 {r.at
                   ? ` · ${Math.max(0, Math.floor(Date.now() / 1000 - r.at))} 秒`
                   : ""}

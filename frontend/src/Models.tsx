@@ -590,7 +590,11 @@ function ModelEditor({
                 false,
                 1,
               )}
-              {numberField("retries", "网络重试次数")}
+              {numberField(
+                "retries",
+                "自动重试次数",
+                "网络错误和模型格式错误分别使用此次数；0 表示不自动重试。",
+              )}
               {model.role !== "embedding" &&
                 numberField(
                   "max_tool_rounds",

@@ -6,6 +6,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
@@ -499,6 +500,14 @@ class JobStore:
             problem = self.resume_problem(row, conn)
             if problem:
                 raise ConflictError(problem)
+            checkpoint = deepcopy(row.get("checkpoint") or {})
+            if row["status"] in RESUMABLE_STATUSES:
+                for state in checkpoint.get("stages", {}).values():
+                    if "result" not in state and state.get("format_failure"):
+                        # Only explicit resumption replenishes an exhausted format-retry allowance.
+                        # Keep all tool feedback, completed stages and accumulated usage.
+                        for key in ("format_failure", "format_retries", "format_retry"):
+                            state.pop(key, None)
             conn.execute(
                 jobs_table.update()
                 .where(jobs_table.c.id == id)
@@ -510,6 +519,7 @@ class JobStore:
                     owner=None,
                     lease_token=None,
                     lease_until=None,
+                    checkpoint=checkpoint,
                     updated_at=self.now(conn),
                 )
             )

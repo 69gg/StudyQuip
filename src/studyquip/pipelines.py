@@ -183,15 +183,25 @@ class RelationDraft(Structured):
     evidence: EvidenceDraft
 
 
+def operation_schema(schema: Json) -> None:
+    # Literal op values are disjoint. Keep the existing provider-facing anyOf schema
+    # while Pydantic selects one branch locally for useful validation feedback.
+    schema.pop("discriminator", None)
+    schema["anyOf"] = schema.pop("oneOf")
+
+
 class RevisionDraft(Structured):
     operations: list[
-        InsertOperation
-        | UpdateOperation
-        | MoveOperation
-        | SplitOperation
-        | MergeOperation
-        | ArchiveOperation
-        | NodeOperation
+        Annotated[
+            InsertOperation
+            | UpdateOperation
+            | MoveOperation
+            | SplitOperation
+            | MergeOperation
+            | ArchiveOperation
+            | NodeOperation,
+            Field(discriminator="op", json_schema_extra=operation_schema),
+        ]
     ]
     reason: str
     working_summary: str
