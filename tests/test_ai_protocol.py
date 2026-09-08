@@ -9,11 +9,18 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from studyquip.ai import AIProtocolError, AIService, ContextBudgetExceeded, ModelProfile, request_parameters
+from studyquip.ai import (
+    AIProtocolError,
+    AIService,
+    ContextBudgetExceeded,
+    ModelProfile,
+    rejected_result,
+    request_parameters,
+)
 from studyquip.config import Settings
-from studyquip.pipelines import RevisionDraft
+from studyquip.pipelines import QuestionDraft, RevisionDraft
 from studyquip.scheduling import WindowClosed
 
 
@@ -461,9 +468,9 @@ async def test_format_retries_preserve_protocol_feedback_and_window_checkpoint(
         "concepts": [{"name": "概念", "aliases": ["别名"], "evidence": []}],
     }
     invalid = copy.deepcopy(valid)
-    invalid["operations"][0]["block"]["source_page_ids"] = {"item": "page"}
-    invalid["concepts"][0]["aliases"] = {"item": ["别名"]}
-    invalid["concepts"][0]["evidence"] = {"item": []}
+    invalid["operations"][0]["block"]["source_page_ids"] = {"item": "page", "unknown": True}
+    invalid["concepts"][0]["aliases"] = {"item": ["别名"], "unknown": True}
+    invalid["concepts"][0]["evidence"] = {"item": [], "unknown": True}
     with pytest.raises(ValidationError) as failure:
         RevisionDraft.model_validate(invalid)
     assert failure.value.error_count() == 3
@@ -575,6 +582,169 @@ async def test_format_retries_preserve_protocol_feedback_and_window_checkpoint(
             "opaque-1",
             "opaque-2",
         ]
+
+
+@pytest.mark.parametrize("encoding", ["item", "json"])
+def test_model_array_decoding_preserves_text_and_rejects_ambiguous_values(encoding: str) -> None:
+    valid = {
+        "operations": [
+            {
+                "op": "insert",
+                "block": {"node_id": "node", "text": '["原样正文"]', "source_page_ids": ["page"]},
+            }
+        ],
+        "concepts": [
+            {
+                "name": "概念",
+                "aliases": ["别名", "另一个别名"],
+                "evidence": [{"block_id": "block", "revision": 1, "quote": '["原样正文"]'}],
+            }
+        ],
+        "reason": "整理",
+        "working_summary": "",
+    }
+
+    def encode(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: encode(item) for key, item in value.items()}
+        if isinstance(value, list):
+            items = [encode(item) for item in value]
+            return (
+                {"item": items[0] if len(items) == 1 else items}
+                if encoding == "item"
+                else json.dumps(items, ensure_ascii=False)
+            )
+        return value
+
+    raw = encode(valid)
+    original = copy.deepcopy(raw)
+    assert RevisionDraft.model_validate(raw) == RevisionDraft.model_validate(valid)
+    assert raw == original
+    question = QuestionDraft(type="short_answer", stem='["正文"]', answer_from_reference='["答案"]')
+    assert question.stem == '["正文"]' and question.answer_from_reference == '["答案"]'
+    for bad in ("page", "['page']", {"item": "page", "extra": True}, {"item": None}, [None]):
+        invalid = copy.deepcopy(valid)
+        invalid["operations"][0]["block"]["source_page_ids"] = bad
+        with pytest.raises(ValidationError):
+            RevisionDraft.model_validate(invalid)
+    missing = copy.deepcopy(valid)
+    del missing["operations"][0]["op"]
+    with pytest.raises(ValidationError, match="union_tag_not_found"):
+        RevisionDraft.model_validate(missing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol,store", [("chat", False), ("responses", False), ("responses", True)])
+async def test_resume_revalidates_saved_result_without_another_model_call(
+    protocol: str, store: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = profile(protocol=protocol, store=store, retries=0)
+    raw = {
+        "operations": [
+            {
+                "op": "insert",
+                "block": {"node_id": "node", "text": "正文", "source_page_ids": '["page"]'},
+            }
+        ],
+        "concepts": [{"name": "概念", "aliases": {"item": "别名"}, "evidence": {"item": []}}],
+        "reason": "整理",
+        "working_summary": "",
+    }
+    arguments = json.dumps(raw, ensure_ascii=False)
+    requests = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        body = (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "reasoning_content": "opaque-reasoning",
+                            "tool_calls": [
+                                {
+                                    "id": "submit",
+                                    "type": "function",
+                                    "function": {"name": "submit_result", "arguments": arguments},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+            if protocol == "chat"
+            else {
+                "id": "response",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "id": "reason", "summary": [], "encrypted_content": "opaque"},
+                    {
+                        "type": "function_call",
+                        "id": "item",
+                        "call_id": "submit",
+                        "name": "submit_result",
+                        "arguments": arguments,
+                        "status": "completed",
+                    },
+                ],
+            }
+        )
+        body["usage"] = {"input_tokens": 10, "output_tokens": 20}
+        return httpx.Response(200, json=body)
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {}
+    validate = RevisionDraft.model_validate
+
+    def legacy_validate(value: Any) -> RevisionDraft:
+        # Reproduce the old list[str] validator without changing the wire schema.
+        TypeAdapter(list[str]).validate_python(value["operations"][0]["block"]["source_page_ids"])
+        return validate(value)
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(RevisionDraft, "model_validate", legacy_validate)
+        with pytest.raises(AIProtocolError, match="已用完 0 次"):
+            await ai.structured(configured, "整理", RevisionDraft, state=state)
+    assert state["rejected_result"]["arguments"] == arguments and requests == 1
+    # A failed task still requires explicit resume, even after the parser was upgraded.
+    with pytest.raises(AIProtocolError, match="已用完"):
+        await ai.structured(configured, "整理", RevisionDraft, state=state)
+    if protocol == "chat":
+        state.pop("rejected_result")  # Legacy checkpoints only retained the raw transcript.
+    history = copy.deepcopy(state["transcript"])
+    state.pop("format_failure")  # The resume endpoint clears this only for an explicit continuation.
+    checkpoint = json.loads(json.dumps(state))
+    result = await ai.structured(configured, "整理", RevisionDraft, state=checkpoint)
+    assert result.operations[0].block.source_page_ids == ["page"]
+    assert result.concepts[0].aliases == ["别名"]
+    assert requests == 1 and checkpoint["usage"] == state["usage"]
+    assert checkpoint["transcript"] == history
+    assert checkpoint["result_recovered_from_call_id"] == "submit" and not checkpoint["pending"]
+    assert "rejected_result" not in checkpoint
+    assert await ai.structured(configured, "新的处理单元", RevisionDraft) == result
+    assert requests == 2  # The same encoding is accepted on its first response in new units.
+
+
+def test_legacy_result_recovery_requires_a_completed_isolated_submission() -> None:
+    call = {"id": "submit", "function": {"name": "submit_result", "arguments": "{}"}}
+    state = {
+        "transcript": [
+            {"role": "assistant", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "submit", "content": '{"error":"invalid"}'},
+        ]
+    }
+    assert rejected_result(state, "chat")["call_id"] == "submit"
+    assert rejected_result({**state, "pending": [call]}, "chat") is None
+    assert rejected_result({**state, "rejected_result": None}, "chat") is None
+    assert rejected_result(state, "responses") is None
+    mismatched = copy.deepcopy(state)
+    mismatched["transcript"][-1]["tool_call_id"] = "another-call"
+    assert rejected_result(mismatched, "chat") is None
+    state["transcript"][0]["tool_calls"].append({"id": "read", "function": {"name": "read_block"}})
+    assert rejected_result(state, "chat") is None
 
 
 @pytest.mark.asyncio

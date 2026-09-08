@@ -20,7 +20,9 @@
 
 `ModelProfile.retries` 同时作为网络重试次数和每个结构化单元的格式重试次数，分别计数，默认 2、0 表示关闭。`AIService.structured` 在没有工具调用、空 choices、JSON／字段校验错误时保存反馈后自动重试，通过现有 `_request` 执行准入；`scheduling.retry_delay(attempt)` 共用指数退避。阶段新增 `format_errors`（当前回复尚待处理的校验错误）、`format_retries`（已安排次数）、`format_rounds`（格式失败回复数）、`format_retry:{attempt,limit,next_at,reason}` 和耗尽标志 `format_failure`；`rounds-format_rounds` 受正常工具轮数约束。`pending_batch_size` 保留原工具批次大小。显式恢复已结束任务只清除未完成且耗尽阶段的 `format_failure/format_retries/format_retry`，保留转录、用量和已完成结果；自动恢复不清额度。旧 `repairs` 不再触发固定一次修复限制。
 
-`RevisionDraft.operations` 通过 `op` 判别联合类型；`operation_schema` 保留发往服务商的 `anyOf` 结构。`validation_feedback` 输出字段路径、错误信息与类型，省略原始参数和错误文档链接，不把无效数组包装自动转成合法参数。活动投影另有 `format_attempt/format_limit/reason`，供现有任务界面展示。
+`RevisionDraft.operations` 通过 `op` 判别联合类型；`operation_schema` 保留发往服务商的 `anyOf` 结构。AI 结果数组共用 `ModelList[T]`／`decode_model_list`：仅解码单键 `item` 包装和标准 JSON 数组字符串，再验证全部元素；其他类型错误不猜测修复。无名 `Annotated` 类型别名保持原有 JSON Schema，不修改普通字符串或 HTTP 业务输入。`validation_feedback` 输出字段路径、错误信息与类型，省略原始参数和错误文档链接。活动投影另有 `format_attempt/format_limit/reason`，供现有任务界面展示。
+
+独立结果提交在校验前保存 `rejected_result:{call_id,name,arguments}`，错误反馈和候选按既有检查点提交；更新回复到达后清除旧候选。`rejected_result(state,protocol)` 拒绝未完成批次，兼容从旧 Chat 末尾的独立提交／匹配错误反馈重建候选。显式继续并确认模型、工具定义兼容后，先重新解析最后候选；成功则记录 `result_recovered_from_call_id` 并进入既有业务提交，失败继续原重试协议。原始转录、累计用量不变；原页版本、输入指纹、操作回执和租约仍逐层校验。配置／工具结构变化时连同旧协议清除候选，不以旧结果替代新模型运行。
 
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 

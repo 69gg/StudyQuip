@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import TypeAdapter
 
 from studyquip.ai import AIService, ModelProfile, split_legacy_model_roles
 from studyquip.api import create_app
@@ -23,7 +24,7 @@ from studyquip.context import node_source_fingerprint
 from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
 from studyquip.media import store_upload
-from studyquip.pipelines import PipelineContext, QuestionDraft, question_text_fields
+from studyquip.pipelines import PipelineContext, QuestionDraft, RevisionDraft, question_text_fields
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
@@ -219,10 +220,11 @@ async def test_worker_startup_restores_legacy_review_pages_without_losing_text_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "legacy_checkpoint,failure_kind", [(False, "network"), (True, "network"), (True, "format")]
+    "legacy_checkpoint,failure_kind",
+    [(False, "network"), (True, "network"), (True, "format"), (True, "legacy_array")],
 )
 async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
-    tmp_path: Path, legacy_checkpoint: bool, failure_kind: str
+    tmp_path: Path, legacy_checkpoint: bool, failure_kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(data_dir=tmp_path)
     initialize(settings)
@@ -267,6 +269,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         )
         requests: list[dict[str, Any]] = []
         saved_transcript: list[dict[str, Any]] = []
+        format_failure = failure_kind != "network"
 
         def respond(request: httpx.Request) -> httpx.Response:
             wire = json.loads(request.content)
@@ -286,7 +289,10 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
                                 "block": {
                                     "node_id": root["id"],
                                     "text": pages[1]["text"],
-                                    "source_page_ids": {"item": pages[1]["id"]},
+                                    "source_page_ids": {
+                                        "item": pages[1]["id"],
+                                        **({"unknown": True} if failure_kind == "format" else {}),
+                                    },
                                 },
                             }
                         ],
@@ -351,16 +357,27 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         task = jobs.enqueue("book_process", book["id"])
         claimed = jobs.claim(worker.owner)
         assert claimed
-        await worker.execute(claimed)
+        if failure_kind == "legacy_array":
+            validate = RevisionDraft.model_validate
+
+            def legacy_validate(value: Any) -> RevisionDraft:
+                TypeAdapter(list[str]).validate_python(value["operations"][0]["block"]["source_page_ids"])
+                return validate(value)
+
+            with monkeypatch.context() as legacy:
+                legacy.setattr(RevisionDraft, "model_validate", legacy_validate)
+                await worker.execute(claimed)
+        else:
+            await worker.execute(claimed)
         failed = jobs.get(task["id"])
         assert failed and failed["status"] == "failed"
-        assert ("已用完 0 次" if failure_kind == "format" else "模型请求失败") in failed["error"]
+        assert ("已用完 0 次" if format_failure else "模型请求失败") in failed["error"]
         checkpoint = copy.deepcopy(failed["checkpoint"])
         stage = checkpoint["stages"][f"revise:{pages[1]['id']}:1:0:0"]
-        assert stage["pending"] == [] and stage["rounds"] == (2 if failure_kind == "format" else 1)
+        assert stage["pending"] == [] and stage["rounds"] == (2 if format_failure else 1)
         saved_transcript = copy.deepcopy(stage["transcript"])
-        assert len(saved_transcript) == (4 if failure_kind == "format" else 2)
-        if failure_kind == "format":
+        assert len(saved_transcript) == (4 if format_failure else 2)
+        if format_failure:
             assert stage["format_failure"] and stage["format_rounds"] == 1
             assert db.get("page", pages[1]["id"]) == pages[1]
             assert len(records(db, "block", {"book_id": book["id"]})) == 1
@@ -368,6 +385,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         if legacy_checkpoint:
             # Existing installations have these transcripts but no initial-input snapshot yet.
             stage.pop("request_context")
+            stage.pop("rejected_result", None)
             checkpoint.pop("revision_plans")
             # Startup also upgrades legacy roles without invalidating compatible saved tool history.
             db.put("model", {**configured, "role": "chat"}, id=configured["id"])
@@ -402,7 +420,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
             assert scheduled["id"] == task["id"] and scheduled["not_before"] > time.time() + 3500
             repeated = client.post(f"/api/jobs/{task['id']}/resume", json={}).json()
             assert repeated["reused"] and repeated["not_before"] == scheduled["not_before"]
-            if failure_kind == "format":
+            if format_failure:
                 stage.pop("format_failure")
             assert jobs.get(task["id"])["checkpoint"] == checkpoint
             assert jobs.claim(worker.owner) is None
@@ -412,15 +430,17 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         await worker.execute(resumed)
         current = jobs.get(task["id"])
         assert current and current["status"] == "completed"
-        assert len(requests) == 3  # No repeated recognition, first-page revision, or tool read.
+        assert len(requests) == (2 if failure_kind == "legacy_array" else 3)
         assert db.get("page", pages[0]["id"]) == pages[0]
         assert db.get("block", first_block["id"]) == first_block
         assert db.get("page", pages[1]["id"])["status"] == "processed"
         assert len(records(db, "block", {"book_id": book["id"]})) == 2
         assert len(current["checkpoint"]["completed_units"]) == 1
-        assert current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]["usage"]["requests"] == (
-            3 if failure_kind == "format" else 2
-        )
+        final_stage = current["checkpoint"]["stages"][f"revise:{pages[1]['id']}:1:0:0"]
+        assert final_stage["usage"]["requests"] == (3 if failure_kind == "format" else 2)
+        if failure_kind == "legacy_array":
+            assert final_stage["result_recovered_from_call_id"] == "call-2"
+            assert final_stage["transcript"] == saved_transcript
         with pytest.raises(ConflictError, match="已结束"):
             jobs.resume(task["id"], time.time())
         # Reuse this saved input to check source fencing on a failed task, without dispatching again.

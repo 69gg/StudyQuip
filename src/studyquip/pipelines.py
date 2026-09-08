@@ -9,9 +9,9 @@ import json
 import time
 import uuid
 from collections.abc import Callable
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
 from sqlalchemy.engine import Connection
 
 from studyquip.ai import (
@@ -36,6 +36,26 @@ class Structured(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def decode_model_list(value: Any) -> Any:
+    """Decode unambiguous array encodings only; item validation still belongs to Pydantic."""
+    if isinstance(value, dict) and set(value) == {"item"}:
+        item = value["item"]
+        return item if isinstance(item, list) else [item]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return value
+        if isinstance(decoded, list):
+            return decoded
+    return value
+
+
+ListItem = TypeVar("ListItem")
+# An unnamed Annotated alias preserves the existing provider-facing array schema.
+ModelList = Annotated[list[ListItem], BeforeValidator(decode_model_list)]
+
+
 class Option(Structured):
     id: str
     text: str
@@ -51,12 +71,12 @@ class QuestionDraft(Structured):
     subject_id: str | None = None
     type: Literal["single_choice", "multiple_choice", "fill_blank", "short_answer"]
     stem: str
-    options: list[Option] = Field(default_factory=list)
-    answer_from_reference: str | list[str] | None = None
+    options: ModelList[Option] = Field(default_factory=list)
+    answer_from_reference: str | ModelList[str] | None = None
     wrong_answer: str | None = None
     reference_analysis: str | None = None
     # Cached results from before formula formatting must not rewrite existing text.
-    formatting_issues: list[QuestionFormattingIssue] | None = None
+    formatting_issues: ModelList[QuestionFormattingIssue] | None = None
 
 
 class EvidenceDraft(Structured):
@@ -69,9 +89,9 @@ class EvidenceDraft(Structured):
 
 class ExplanationDraft(Structured):
     summary: str
-    steps: list[str]
-    knowledge_points: list[str]
-    citations: list[EvidenceDraft] = Field(default_factory=list)
+    steps: ModelList[str]
+    knowledge_points: ModelList[str]
+    citations: ModelList[EvidenceDraft] = Field(default_factory=list)
     answer_conflict: str | None = None
     error_reason_optimized: str | None = None
 
@@ -92,7 +112,7 @@ class BlockDraft(Structured):
     node_id: str
     type: str = "paragraph"
     order: float | None = None
-    source_page_ids: list[str] = Field(default_factory=list)
+    source_page_ids: ModelList[str] = Field(default_factory=list)
 
 
 class BlockChanges(Structured):
@@ -148,13 +168,13 @@ class SplitOperation(Structured):
     op: Literal["split"]
     id: str
     base_revision: int
-    parts: list[str]
+    parts: ModelList[str]
 
 
 class MergeOperation(Structured):
     op: Literal["merge"]
-    ids: list[str]
-    base_revisions: list[VersionRef]
+    ids: ModelList[str]
+    base_revisions: ModelList[VersionRef]
     text: str | None = None
 
 
@@ -172,8 +192,8 @@ class NodeOperation(Structured):
 class ConceptDraft(Structured):
     id: str | None = None
     name: str
-    aliases: list[str] = Field(default_factory=list)
-    evidence: list[EvidenceDraft] = Field(default_factory=list)
+    aliases: ModelList[str] = Field(default_factory=list)
+    evidence: ModelList[EvidenceDraft] = Field(default_factory=list)
 
 
 class RelationDraft(Structured):
@@ -191,7 +211,7 @@ def operation_schema(schema: Json) -> None:
 
 
 class RevisionDraft(Structured):
-    operations: list[
+    operations: ModelList[
         Annotated[
             InsertOperation
             | UpdateOperation
@@ -206,10 +226,10 @@ class RevisionDraft(Structured):
     reason: str
     working_summary: str
     current_node_id: str | None = None
-    open_anchors: list[str] = Field(default_factory=list)
-    concepts: list[ConceptDraft] = Field(default_factory=list)
-    relations: list[RelationDraft] = Field(default_factory=list)
-    closed_node_ids: list[str] = Field(default_factory=list)
+    open_anchors: ModelList[str] = Field(default_factory=list)
+    concepts: ModelList[ConceptDraft] = Field(default_factory=list)
+    relations: ModelList[RelationDraft] = Field(default_factory=list)
+    closed_node_ids: ModelList[str] = Field(default_factory=list)
 
 
 class SummaryItem(Structured):
@@ -218,7 +238,7 @@ class SummaryItem(Structured):
 
 
 class Summaries(Structured):
-    summaries: list[SummaryItem]
+    summaries: ModelList[SummaryItem]
 
 
 class Probe(Structured):
@@ -609,7 +629,10 @@ def retrieval_tools(
     async def read(args: Json) -> Any:
         block = await asyncio.to_thread(ctx.db.get, "block", str(args["block_id"]))
         if block is None or block.get("book_id") not in book_ids or block.get("archived"):
-            raise ValueError("块不存在或超出允许范围")
+            raise ValueError(
+                "块不存在或超出允许范围；block_id 必须是已提供或检索返回的正文块 ID，"
+                "不能使用教材、目录或原页 ID。尚未插入的新正文无法通过 read_block 读取。"
+            )
         start = max(0, int(args.get("start") or 0))
         end = int(args.get("end") or len(block["text"]))
         if end < start or end > len(block["text"]):
@@ -1027,6 +1050,10 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
         )
         unit_count = context["current_page"].get("unit_count", 1)
         prompt = (
+            "current_page.text 就是本次处理单元的草稿，无需再用工具读取当前页。"
+            "current_page.id 是原页 ID，只用于 source_page_ids；ancestors/outline 中的 ID 是目录 ID，"
+            "两者都不能作为 read_block.block_id。只新增正文且上下文已足够时直接提交，"
+            "仅在确实缺少依据或需要修改已有正文时使用读取工具；不要为完成流程反复浏览同一目录。"
             "按原始顺序把当前教材草稿修订为正式文章。目录可以任意深度，保留真实标题，不硬编码章节。使用块级操作，修改前文必须读取最新块及版本；摘要不能代替原文。新目录和新块使用新唯一 ID；现有 ID 来自上下文或工具。当前页续接前页可合并，保留最前块 ID。遇到跳过缺口禁止拼句或补造目录。人工保护块只能形成建议，但当前页新正文必须先独立插入。每个内容块尽量是一段话，插图描述和侧栏为独立块。提交工作摘要和未闭合锚点，不重复整本前文。概念、别名和关系可随本次提取，但必须引用实际块版本与原文；新插入块版本为 1。无证据留空。只在当前单元末尾关闭确实结束的目录节点。\n"
             + json.dumps(context, ensure_ascii=False)
         )
