@@ -17,11 +17,11 @@ from .question_tree import figure_asset_ids, leaf_questions, walk_questions
 from .schemas import ExportInput, validate_question
 
 
-def explanation_stale(db: Database, question: dict[str, Any]) -> bool:
-    return any(node_explanation_stale(db, node) for node in walk_questions(question))
+def explanation_stale(db: Database, question: dict[str, Any], conn: Connection | None = None) -> bool:
+    return any(node_explanation_stale(db, node, conn) for node in walk_questions(question))
 
 
-def node_explanation_stale(db: Database, question: dict[str, Any]) -> bool:
+def node_explanation_stale(db: Database, question: dict[str, Any], conn: Connection | None = None) -> bool:
     if question.get("explanation_stale"):
         return True
     explanation = question.get("explanation") or {}
@@ -31,12 +31,12 @@ def node_explanation_stale(db: Database, question: dict[str, Any]) -> bool:
             continue
         block_id = reference.get("block_id")
         if reference.get("book_id"):
-            book = db.get("book", reference["book_id"])
+            book = db.get("book", reference["book_id"], conn=conn)
             if not book or book.get("deleted"):
                 return True
         revision = reference.get("revision", reference.get("block_revision"))
         if block_id and revision is not None:
-            block = db.get("block", block_id)
+            block = db.get("block", block_id, conn=conn)
             if not block or block.get("revision") != revision or block.get("archived"):
                 return True
     return False

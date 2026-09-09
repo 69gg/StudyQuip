@@ -47,11 +47,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         from .ai import split_legacy_model_roles
+        from .question_index import reconcile_question_indexes
 
         try:
             with runtime_lock(config):
                 await asyncio.to_thread(split_legacy_model_roles, db)
                 await asyncio.to_thread(ensure_default_subjects, db, config.default_subjects)
+                await asyncio.to_thread(reconcile_question_indexes, db)
                 application.state.db = db
                 yield
         finally:
@@ -620,16 +622,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/api/search")
     def search(body: SearchInput) -> Any:
-        from .retrieval import RetrievalService
+        from .retrieval import RetrievalService, search_limit
+        from .search import search_stage
 
         data = body.model_dump()
+        search_limit(db, body.limit)
+        if body.target == "book":
+            with db.read() as conn:
+                service = RetrievalService(db)
+                scope = service.scoped_books(body.book_ids, body.subject_id, conn)
+                if body.node_id:
+                    service.descendants(body.node_id, scope, conn)
         embedding_models = db.list("model", filters={"role": "embedding"})
-        if body.mode in {"semantic", "hybrid"} and embedding_models:
+        if "semantic" in body.methods and embedding_models:
             job = jobs.request("search", data, lambda conn: db.put("search", data, conn=conn))
             return JSONResponse(status_code=202, content={"job": present_job(job)})
-        if body.mode == "semantic":
+        if "semantic" in body.methods:
             raise ValueError("请先配置嵌入模型")
-        return RetrievalService(db).search(**data)
+        return search_stage(db, body, "keyword")
+
+    @application.get("/api/search/options")
+    def search_options() -> dict[str, Any]:
+        from .question_index import PART_LABELS
+
+        return {
+            "parts": PART_LABELS,
+            "default_limit": config.search_default_limit,
+            "max_limit": config.search_max_limit,
+            "default_methods": ["keyword"],
+        }
 
     @application.get("/api/jobs")
     def list_jobs() -> list[dict[str, Any]]:

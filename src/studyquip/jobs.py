@@ -28,6 +28,7 @@ JOB_RESOURCE_KINDS = {
     "question_extract": "question",
     "question_explain": "question",
     "question_audio": "question",
+    "question_index": "question",
     "model_test": "model",
     "search": "search",
     "export_pdf": "export",

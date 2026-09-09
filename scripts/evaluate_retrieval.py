@@ -1,4 +1,4 @@
-"""Small deterministic ablation fixture; no model calls or production data writes."""
+"""Small deterministic independent-order fixture; no model calls or production data writes."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any
 from studyquip.config import Settings
 from studyquip.db import Database, initialize
 from studyquip.retrieval import RetrievalService
+from studyquip.search import append_stage
 from studyquip.textbook import TextbookService, new_id
 
 
@@ -100,27 +101,25 @@ def evaluate() -> dict[str, Any]:
             )
         cases = [
             ("直接正文", "自由落体", {blocks[0]["id"]}),
-            ("目录概述路由", "行星轨道", {blocks[2]["id"]}),
-            ("概念关系补充", "惯性", {blocks[3]["id"], blocks[5]["id"]}),
+            ("目录相关词", "行星轨道", {blocks[2]["id"]}),
+            ("概念名称", "惯性", {blocks[3]["id"], blocks[5]["id"]}),
         ]
         rows = []
         for name, query, relevant in cases:
             variants = {}
-            for variant, structure, relations in [
-                ("flat_mixed", False, False),
-                ("directory", True, False),
-                ("directory_relations", True, True),
-            ]:
-                results = retrieval.search(
-                    query,
-                    book_ids=[book["id"]],
-                    mode="hybrid",
-                    limit=2,
-                    query_vector=[1.0, 0.0],
-                    space_fingerprint="deterministic-fixture",
-                    include_structure=structure,
-                    include_relations=relations,
-                )
+            for methods in (["keyword"], ["semantic"], ["semantic", "keyword"], ["keyword", "semantic"]):
+                variant = "_then_".join(methods)
+                results: list[dict[str, Any]] = []
+                for step, method in enumerate(methods, 1):
+                    hits = retrieval.search(
+                        query,
+                        book_ids=[book["id"]],
+                        mode=method,
+                        limit=2,
+                        query_vector=[1.0, 0.0] if method == "semantic" else None,
+                        space_fingerprint="deterministic-fixture" if method == "semantic" else None,
+                    )
+                    append_stage(results, hits, step)
                 found = {item["id"] for item in results}
                 variants[variant] = {
                     "hit_count": len(found & relevant),
@@ -136,7 +135,7 @@ def evaluate() -> dict[str, Any]:
             rows.append({"case": name, "query": query, "variants": variants})
         db.close()
         return {
-            "fixture": "6 synthetic Chinese blocks; deterministic two-dimensional vectors; top 2",
+            "fixture": "6 synthetic Chinese blocks; deterministic two-dimensional vectors; each method top 2; explicit order, first occurrence wins",
             "model_calls": 0,
             "cases": rows,
         }

@@ -19,6 +19,8 @@ from studyquip.config import Settings
 from studyquip.db import Database, runtime_lock
 from studyquip.jobs import JobStore, LeaseLost
 from studyquip.pipelines import HANDLERS, NeedsReview, PipelineContext
+from studyquip.question_index import QuestionIndex, reconcile_question_indexes
+from studyquip.retrieval import embedding_fingerprint
 from studyquip.scheduling import WindowClosed
 from studyquip.subjects import ensure_default_subjects
 
@@ -111,6 +113,18 @@ class Worker:
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
         active: set[asyncio.Task[None]] = set()
+        last_space: str | None = None
+        first_pass = True
+
+        def embedding_space() -> str:
+            with self.db.read() as conn:
+                profile = QuestionIndex(self.db).profile(conn)
+                return (
+                    embedding_fingerprint(profile, profile.get("embedding_dimensions") or 0)
+                    if profile
+                    else "unconfigured"
+                )
+
         try:
             await asyncio.to_thread(ensure_default_subjects, self.db, self.settings.default_subjects)
             converted = await asyncio.to_thread(split_legacy_model_roles, self.db)
@@ -120,6 +134,10 @@ class Worker:
             if restored:
                 logger.info("已将 %s 个旧待校对页面恢复为草稿", restored)
             while not stop.is_set():
+                space = await asyncio.to_thread(embedding_space)
+                if first_pass or space != last_space:
+                    await asyncio.to_thread(reconcile_question_indexes, self.db)
+                    first_pass, last_space = False, space
                 while not stop.is_set():
                     job = await asyncio.to_thread(self.jobs.claim, self.owner)
                     if job is None:

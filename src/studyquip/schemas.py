@@ -155,9 +155,40 @@ class ExportInput(BaseModel):
 
 class SearchInput(BaseModel):
     query: str
+    target: Literal["book", "question"] = "book"
+    context: Literal["search", "print"] = "search"
     subject_id: str | None = None
     book_ids: list[str] | None = None
     node_id: str | None = None
-    mode: Literal["hybrid", "keyword", "phrase", "semantic"] = "hybrid"
-    keyword_mode: Literal["any", "all"] = "any"
-    limit: int = Field(12, ge=1, le=100)
+    methods: list[Literal["keyword", "semantic"]] = Field(
+        default_factory=lambda: ["keyword"], min_length=1, max_length=2
+    )
+    # Single-method clients remain valid; removed combined modes are deliberately rejected.
+    mode: Literal["keyword", "phrase", "semantic"] | None = None
+    keyword_mode: Literal["any", "all", "phrase"] = "any"
+    parts: list[
+        Literal[
+            "stem", "options", "answer", "explanation", "knowledge", "material", "reference", "error_reason"
+        ]
+    ] = Field(default_factory=lambda: ["stem"], min_length=1)
+    question_types: list[
+        Literal["single_choice", "multiple_choice", "fill_blank", "short_answer", "composite"]
+    ] = Field(default_factory=list)
+    confirmed_only: bool = False
+    limit: int | None = Field(None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_search(self) -> "SearchInput":
+        if self.mode:
+            requested = ["keyword" if self.mode == "phrase" else self.mode]
+            if "methods" in self.model_fields_set and self.methods != requested:
+                raise ValueError("mode 与 methods 冲突")
+            self.methods = requested
+            if self.mode == "phrase":
+                self.keyword_mode = "phrase"
+        if len(set(self.methods)) != len(self.methods):
+            raise ValueError("检索方式不能重复")
+        self.parts = list(dict.fromkeys(self.parts))
+        if self.target == "question" and (self.book_ids or self.node_id):
+            raise ValueError("题目检索不接受教材目录范围；请使用科目、题型和题目部分筛选")
+        return self

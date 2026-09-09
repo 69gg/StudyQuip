@@ -40,7 +40,7 @@ worker 持有在途协程的强引用，完成回调释放引用，退出时取�
 
 ## 模块边界
 
-- ai.py/scheduling.py/worker.py/pipelines.py 提供 ModelProfile、模型调用、限流和任务处理器。任务类型包括 `model_test`、`question_extract`、`question_explain`、`book_process`、`page_recognize`、`book_index`、`suggestion_regenerate`、`search`、`export_pdf`；导出任务调用 export 模块。
+- ai.py/scheduling.py/worker.py/pipelines.py 提供 ModelProfile、模型调用、限流和任务处理器。任务类型包括 `model_test`、`question_extract`、`question_explain`、`question_audio`、`question_index`、`book_process`、`page_recognize`、`book_index`、`suggestion_regenerate`、`search`、`export_pdf`；导出任务调用 export 模块。
 - progress.py 提供 `JobProgress(db,conn).present(job)` 和 `present_jobs(db)`，将内部任务转换为页面可用的精简进度投影；不泄露检查点里的完整协议项、图片或凭据。
 - lexical.py/textbook.py/context.py/retrieval.py 通过 records 存 book/page/node/block/concept/relation/suggestion/redirect 等；专用 FTS/vectors SQL 表由 retrieval.initialize_indexes(conn) 管理。
 - frontend/ 使用 /api 同源接口；生产初始化不写演示数据。独立验收脚本只向隔离目录写入测试样本。
@@ -67,7 +67,7 @@ GET/POST /api/books；GET/PUT/DELETE /api/books/{id}，fields title,subject_id,t
 
 GET/POST /api/models；PUT/DELETE /api/models/{id}；POST /api/models/{id}/test。Model fields name,role(book_vision|book_text|question_vision|question_text|embedding),protocol(chat|responses),base_url,api_key(读不返回),model,thinking(omit|enabled|disabled),reasoning_effort,temperature,top_p,max_output_tokens,max_tokens_field(max_completion_tokens|max_tokens),context_tokens,timeout_seconds,retries,max_tool_rounds,max_concurrency(default4),credential_max_concurrency(null),store(false),strict_tools(bool),extra_body(object),organization,project,auth_scope,windows([{start:"HH:MM",end:"HH:MM"}]),timezone,embedding_dimensions,embedding_revision,document_prefix,query_prefix。读返回 has_api_key、effective_max_concurrency。
 
-POST /api/assets multipart file；GET /api/assets/{id}/file 与 /preview；POST /api/assets/{id}/crop {box:[x1,y1,x2,y2]}（归正图像素坐标）。POST /api/search {query,subject_id?,book_ids?,node_id?,mode:hybrid|keyword|phrase|semantic,keyword_mode:any|all,limit?}。
+POST /api/assets multipart file；GET /api/assets/{id}/file 与 /preview；POST /api/assets/{id}/crop {box:[x1,y1,x2,y2]}（归正图像素坐标）。POST /api/search {query,subject_id?,book_ids?,node_id?,target:book|question,methods:[keyword|semantic],keyword_mode:any|all|phrase,parts?,question_types?,confirmed_only?,limit?,context:search|print}。
 
 Model 另有 `tool_choice:required|auto|omit`，默认 `required`；`omit` 完全不发送工具选择参数。该字段同时适用于 Chat Completions 与 Responses，仍发送工具定义并校验结构化结果。旧模型记录由服务端补默认值，无需架构迁移。
 
@@ -75,7 +75,7 @@ Model 的 `max_output_tokens:int|null` 默认 `null`；前端新增配置默认�
 
 Model 的 `context_tokens:int|null` 默认 `null`；前端非必填，新增时留空，清空后提交 `null`，填写时最小为 1024。该字段不映射到 Chat Completions、Responses 或 Embeddings 请求，也禁止通过 `extra_body` 发送。为空时省略完整请求、材料组装、正文读取及概述／嵌入分批的长度限制；删除 `effective_context_tokens` 的应用预算回退。显式上限才触发材料分段和完整请求检查，报错包含保守估算及设置值；已有显式值保留，无需架构迁移。`ContextBuilder(db,token_budget:int|None=None)` 支持整页无长度限制；`retrieval_tools(...,context_tokens:int|None=None)` 以同一配置限制读取，仍始终验证教材范围及来源版本。完整协议项不被裁剪。
 
-无需嵌入请求的检索同步返回结果数组；配置了嵌入模型的 semantic/hybrid 查询返回 HTTP 202 `{job: ...}`，由 worker 获取查询向量。前端从任务结果 `result.hits` 读取命中，不绕过 worker 直接调用服务商。校对操作组必须提供应用生成的 `operation_group_id`（也接受 `group_id`）；没有 ID 明确报错。
+无需嵌入请求的检索同步返回结果数组；包含 semantic 步骤的查询返回 HTTP 202 `{job: ...}`，由 worker 获取查询向量。前端从任务结果 `result.hits` 读取命中，不绕过 worker 直接调用服务商。校对操作组必须提供应用生成的 `operation_group_id`（也接受 `group_id`）；没有 ID 明确报错。
 
 GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/exports {question_ids,mode:practice|review,include_answer,include_explanation,include_knowledge,blank_lines} 返回job；GET /api/exports/{id} 返回 snapshot/status/url；GET /api/exports/{id}/file 下载。GET /api/export-snapshot/{id}?token=... 供独立导出路由，token限快照；前端 /print/{id}?token=... 使用该接口共用内容渲染，设置 window.__STUDYQUIP_PRINT_READY__ / __STUDYQUIP_PRINT_ERROR__。
 
@@ -99,3 +99,16 @@ GET /api/jobs；POST /api/jobs/{id}/cancel,/retry,/reschedule。POST /api/export
 `subjects.ensure_default_subjects` 在 Web／worker 启动时执行短事务。默认列表配置 `default_subjects`；NFC＋strip 同名复用 ID，以 app_state 中的预设名称→ID 标记避免重命名后重建旧名。`POST /api/subjects` 同名返回原科目；`PUT /api/subjects/{id}` 带 name/revision，保持 ID，撞名拒绝而不合并题目或教材。
 
 导出递归检查所有基础题答案与讲解有效性，快照保留完整树。签名附件权限递归包含子题配图；当前 API 投影与历史快照分开，不改写旧引用。Print/QuestionContent 共享多级题号、材料、SVG/plot 与上传插图，练习隐藏答案、解析、听力文稿，仅简答题按 blank_lines 留白；复习展示选择的解析、错因和教材路径。等待字体、图片解码、KaTeX 和图形渲染错误检测后才生成 PDF。
+
+
+## 题目分部索引与查询契约（0002）
+
+`question_index.QuestionIndex.sync(question,conn)` 在 `Database.put("question",...)` 的同一事务更新投影、清除变更部分的旧向量，并按需去重入队 `question_index`。`Database.delete` 同样清理派生表。`reconcile_question_indexes(db)` 用于启动补齐和嵌入空间变化，每题单独事务，不生成题目历史版本；缺少模型时只保留关键词索引。模型请求全部使用已有 worker。
+
+`question_parts` 以 uuid5(root_question_id,node_id,part) 生成稳定 ID，保存 question_id/node_id/part/node_type/path/question_revision/text/content_fp/lexical_fp。`part` 为 stem/options/answer/explanation/knowledge/material/reference/error_reason；路径按实际嵌套序号生成，无固定深度。`content_fp` 由有版本提取规则与 NFC 完整文字生成，根题的 revision 与文字指纹分离。`question_fts` 使用共享 jieba/词法规范。`question_vectors` 以 part_id/space_fp 为主键，带 content_fp、dim、dtype、BLOB，删除部分通过外键级联移除向量。修改即时失效，未改文字跨题目版本复用；不改题目本身来保存索引状态。
+
+`QuestionIndex.search` 在同一个只读快照校验当前题目版本、删除状态、解析引文版本，再执行 FTS 或预筛选的物化向量计算；同表多维度先按空间／维度／长度过滤，使用受保护距离表达式。一个根题只返回所选部分中最匹配的一处，附 question_id/question_revision/node_id/path/part/part_label/text/method/rank/score；题型条件可匹配根题或命中子题的自身类型。部分之间不拼接短语。
+
+`SearchInput.methods` 默认仅 `["keyword"]`，长度 1–2，禁止重复；顺序有效。单方式兼容字段 `mode=keyword|semantic|phrase` 仍接受，phrase 转为关键词短语，旧组合值明确拒绝。`limit` 留空使用集中配置，超出返回 422；LLM 工具使用更小上限。每步独立读取当前内容，最终再次排除前面步骤中已过期的命中，按 step/rank 顺序追加、以根题／教材块 ID 去重，不混合分数，不对前一步结果再次筛选。两个方式显式开启后每种最多 limit，总数可能为 2×limit；默认只执行一个。`GET /api/search/options` 返回部分标签、默认方式、默认条数及最大条数，UI 复用服务端定义。题目 target 不接受教材目录条件。
+
+题目保存立即产生待处理索引，默认延迟 2 秒合并短间隔编辑，模型窗口和并发上限保持原规则。同一题只存在一个活动索引任务，与 question_extract/question_explain/question_audio 不互斥。每批提交校验租约、部分内容指纹与最新空间；结束前同事务复核 pending，出现新内容转为等待下一次执行，不能漏掉最终编辑。已失败索引可以手动继续，启动或空间变化也会为仍缺失的部分重新排队。其他题目处理任务的源版本保护保持不变。

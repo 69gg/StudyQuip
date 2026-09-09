@@ -132,11 +132,6 @@ class RetrievalService:
                 for block in records(self.db, "block", {"book_id": book_id}, conn)
                 if not block.get("archived")
             ]
-            targets.extend(
-                dict(node, object_kind="node", text=node["summary"])
-                for node in records(self.db, "node", {"book_id": book_id}, conn)
-                if node.get("summary") and not node.get("summary_stale") and not node.get("archived")
-            )
             return targets
 
     def existing_embeddings(self, book_id: str, profile: dict[str, Any]) -> set[tuple[str, str, int]]:
@@ -177,18 +172,7 @@ class RetrievalService:
         object_kind: str = "block",
         conn: Connection | None = None,
     ) -> None:
-        if (
-            not values
-            or not all(math.isfinite(value) for value in values)
-            or not any(value != 0 for value in values)
-        ):
-            raise ValueError("向量必须非空、非零并且只包含有限值")
-        blob = sqlite_vec.serialize_float32(values)
-        # float64 finite values can overflow when narrowed to float32.
-        import struct
-
-        if not all(math.isfinite(value) for value in struct.unpack(f"{len(values)}f", blob)):
-            raise ValueError("向量超出 float32 范围")
+        blob = vector_blob(values)
         if conn is None:
             with self.db.write() as active:
                 self.store_embedding(
@@ -276,7 +260,7 @@ class RetrievalService:
             + """)
             SELECT object_id,revision,CASE WHEN dim=:dim AND length(embedding)=4*:dim
             THEN vec_distance_cosine(embedding,:q) END AS distance FROM eligible
-            ORDER BY distance LIMIT :n"""
+            ORDER BY distance, object_id LIMIT :n"""
         ).bindparams(bindparam("books", expanding=True))
         if node_ids is not None:
             statement = statement.bindparams(bindparam("nodes", expanding=True))
@@ -288,18 +272,19 @@ class RetrievalService:
         book_ids: list[str] | None = None,
         subject_id: str | None = None,
         node_id: str | None = None,
-        mode: str = "hybrid",
+        mode: str = "keyword",
         keyword_mode: str = "any",
-        limit: int = 12,
+        limit: int | None = None,
         query_vector: list[float] | None = None,
         space_fingerprint: str | None = None,
-        include_structure: bool = True,
-        include_relations: bool = True,
     ) -> list[dict[str, Any]]:
-        if mode not in {"hybrid", "keyword", "phrase", "semantic"}:
-            raise ValueError("未知检索模式")
-        if not normalize(query) or limit <= 0:
+        if mode not in {"keyword", "phrase", "semantic"}:
+            raise ValueError("仅支持独立的关键词或向量检索")
+        limit = search_limit(self.db, limit)
+        if not normalize(query):
             return []
+        if mode == "phrase":
+            mode, keyword_mode = "keyword", "phrase"
         with self.db.read() as conn:
             books = self.scoped_books(book_ids, subject_id, conn)
             if not books:
@@ -313,213 +298,99 @@ class RetrievalService:
             allowed_nodes = self.descendants(node_id, books, conn) if node_id else None
             if allowed_nodes is not None:
                 blocks = {key: item for key, item in blocks.items() if item.get("node_id") in allowed_nodes}
-            if not blocks:
-                return []
-            # A lexical configuration change cannot silently query an obsolete index.
-            old = (
-                conn.execute(
-                    text("SELECT DISTINCT lexical_fp FROM block_fts WHERE book_id IN :books").bindparams(
-                        bindparam("books", expanding=True)
-                    ),
-                    {"books": books},
-                )
-                .scalars()
-                .all()
-            )
-            if any(value != lexical_fingerprint() for value in old):
-                raise ValueError("词法配置已变化，请重新建立教材索引")
-            settings = self.db.settings
-            candidates = settings.global_candidates
-            channels: list[tuple[float, list[str]]] = []
-            primary_hits: list[str] = []
-            literal: list[str] = []
-            expression = compile_match(query, keyword_mode)
-            if mode in {"keyword", "hybrid"} and expression:
-                statement = text(
-                    """SELECT block_id, revision, bm25(block_fts) AS score FROM block_fts
-                    WHERE block_fts MATCH :query AND book_id IN :books AND lexical_fp=:fp"""
-                    + (" AND node_id IN :nodes" if allowed_nodes is not None else "")
-                    + " ORDER BY score LIMIT :n"
-                ).bindparams(bindparam("books", expanding=True))
-                parameters: dict[str, Any] = {
-                    "query": expression,
-                    "books": books,
-                    "fp": lexical_fingerprint(),
-                    "n": max(candidates, limit),
-                }
-                if allowed_nodes is not None:
-                    statement = statement.bindparams(bindparam("nodes", expanding=True))
-                    parameters["nodes"] = sorted(allowed_nodes)
-                rows = conn.execute(statement, parameters).mappings().all()
-                literal = [
-                    row["block_id"]
-                    for row in rows
-                    if row["block_id"] in blocks
-                    and blocks[row["block_id"]]["revision"] == int(row["revision"])
-                ]
-                channels.append((settings.lexical_weight, literal[: max(candidates, limit)]))
-                primary_hits.extend(literal[: max(candidates, limit)])
-            if mode == "phrase":
-                literal = [
-                    key
-                    for key, value in blocks.items()
-                    if normalize(query) in normalize(value.get("text", ""))
-                ]
-                channels.append((settings.lexical_weight, literal))
-                primary_hits.extend(literal)
-            if query_vector is not None and mode in {"hybrid", "semantic"}:
-                if (
-                    not space_fingerprint
-                    or not query_vector
-                    or not all(math.isfinite(value) for value in query_vector)
-                    or not any(query_vector)
-                ):
-                    raise ValueError("向量检索必须提供有效空间指纹和非零向量")
-                rows = self._vector_hits(
-                    conn,
-                    books,
-                    query_vector,
-                    space_fingerprint,
-                    "block",
-                    max(candidates, limit),
-                    allowed_nodes,
-                )
-                channels.append(
-                    (
-                        settings.dense_weight,
-                        [row["object_id"] for row in rows if row["object_id"] in blocks][
-                            : max(candidates, limit)
-                        ],
+            ranked: list[tuple[str, float | None]] = []
+            if mode == "semantic":
+                if not space_fingerprint or query_vector is None:
+                    raise ValueError("向量检索需要已配置的嵌入模型与查询向量")
+                vector_blob(query_vector)
+                ranked = [
+                    (row["object_id"], row["distance"])
+                    for row in self._vector_hits(
+                        conn, books, query_vector, space_fingerprint, "block", limit, allowed_nodes
                     )
-                )
-                primary_hits.extend(row["object_id"] for row in rows if row["object_id"] in blocks)
-            elif mode == "semantic":
-                raise ValueError("语义检索需要已配置的嵌入模型与查询向量")
-            if mode == "hybrid" and include_structure:
-                query_words = set(index_text(query).split())
-                nodes = [
-                    node
-                    for book in books
-                    for node in records(self.db, "node", {"book_id": book}, conn)
-                    if not node.get("archived")
+                    if row["object_id"] in blocks
                 ]
-                ranked_nodes = sorted(
-                    nodes,
-                    key=lambda item: len(
-                        query_words.intersection(
-                            index_text(
-                                item.get("title", "")
-                                + " "
-                                + (item.get("summary", "") if not item.get("summary_stale") else "")
-                            ).split()
-                        )
-                    ),
-                    reverse=True,
-                )
-                node_vectors = (
-                    self._vector_hits(
-                        conn,
-                        books,
-                        query_vector,
-                        space_fingerprint,
-                        "node",
-                        settings.directory_candidates,
-                        allowed_nodes,
+            elif keyword_mode == "phrase":
+                ranked = [
+                    (block["id"], None)
+                    for block in sorted(
+                        blocks.values(), key=lambda row: (row["book_id"], row.get("order", 0), row["id"])
                     )
-                    if query_vector and space_fingerprint
-                    else []
-                )
-                node_scores: dict[str, float] = defaultdict(float)
-                for rank, node in enumerate(ranked_nodes, start=1):
-                    if query_words.intersection(
-                        index_text(
-                            node.get("title", "")
-                            + " "
-                            + (node.get("summary", "") if not node.get("summary_stale") else "")
-                        ).split()
-                    ):
-                        node_scores[node["id"]] += 1 / (settings.rrf_k + rank)
-                for rank, row in enumerate(node_vectors, start=1):
-                    node_scores[row["object_id"]] += 1 / (settings.rrf_k + rank)
-                ranked_nodes = sorted(
-                    (node for node in nodes if node["id"] in node_scores),
-                    key=lambda node: -node_scores[node["id"]],
-                )
-                routed: list[str] = []
-                for node in ranked_nodes[: settings.directory_candidates]:
-                    subtree = self.descendants(node["id"], books, conn)
-                    scoped = [key for key, item in blocks.items() if item.get("node_id") in subtree]
-                    scoped.sort(
-                        key=lambda key: len(
-                            query_words.intersection(index_text(blocks[key].get("text", "")).split())
+                    if normalize(query) in normalize(block.get("text", ""))
+                ][:limit]
+            else:
+                old = (
+                    conn.execute(
+                        text("SELECT DISTINCT lexical_fp FROM block_fts WHERE book_id IN :books").bindparams(
+                            bindparam("books", expanding=True)
                         ),
-                        reverse=True,
+                        {"books": books},
                     )
-                    routed.extend(scoped[: settings.subtree_candidates])
-                channels.append((settings.directory_weight, routed))
-                expanded: list[str] = []
-                direct = primary_hits
-                frontier = set(literal[:candidates] + routed) or set(direct[:limit])
-                relations = [
-                    relation
-                    for book in books
-                    for relation in records(self.db, "relation", {"book_id": book}, conn)
-                    if relation.get("valid")
-                ]
-                for _ in range(settings.relation_hops if include_relations else 0):
-                    next_frontier: set[str] = set()
-                    for relation in relations:
-                        anchors = relation.get("evidence", [])
-                        anchor_ids = {anchor["block_id"] for anchor in anchors if anchor.get("valid", True)}
-                        if anchor_ids & frontier:
-                            next_frontier.update(anchor_ids & blocks.keys())
-                            for endpoint in (relation.get("source_id"), relation.get("target_id")):
-                                concept = self.db.get("concept", endpoint or "", conn=conn)
-                                if concept and concept.get("book_id") in books:
-                                    next_frontier.update(set(concept.get("block_ids", [])) & blocks.keys())
-                    expanded.extend(sorted(next_frontier, key=lambda key: (blocks[key].get("order", 0), key)))
-                    frontier.update(next_frontier)
-                # Nearby source blocks enrich context without crossing book or subtree scope.
-                ordered_blocks = sorted(
-                    blocks.values(), key=lambda item: (item["book_id"], item.get("order", 0))
+                    .scalars()
+                    .all()
                 )
-                for position, block in enumerate(ordered_blocks):
-                    needs_neighbor = block.get("type") == "figure" or not block.get(
-                        "text", ""
-                    ).rstrip().endswith(("。", ".", "！", "!", "？", "?", "；", ";"))
-                    if include_relations and block["id"] in frontier and needs_neighbor:
-                        for neighbor in ordered_blocks[max(0, position - 1) : position + 2]:
-                            if (
-                                neighbor["book_id"] == block["book_id"]
-                                and neighbor.get("node_id") == block.get("node_id")
-                                and neighbor["id"] != block["id"]
-                            ):
-                                expanded.append(neighbor["id"])
-                channels.append((settings.relation_weight, expanded))
-            scores: dict[str, float] = defaultdict(float)
-            methods: dict[str, list[int]] = defaultdict(list)
-            rrf = settings.rrf_k
-            for channel_number, (weight, keys) in enumerate(channels):
-                for rank, key in enumerate(dict.fromkeys(keys), start=1):
-                    if key in blocks:
-                        scores[key] += weight / (rrf + rank)
-                        methods[key].append(channel_number)
-            ordered = sorted(scores, key=lambda key: (-scores[key], blocks[key].get("order", 0), key))
-            selected = ordered[:limit]
-            direct_candidates = primary_hits
-            if direct_candidates and not set(selected).intersection(direct_candidates):
-                selected = selected[: max(0, limit - 1)] + [direct_candidates[0]]
+                if any(value != lexical_fingerprint() for value in old):
+                    raise ValueError("词法配置已变化，请重新建立教材索引")
+                expression = compile_match(query, keyword_mode)
+                if expression:
+                    statement = text(
+                        """SELECT f.block_id, bm25(block_fts) AS score FROM block_fts f
+                        JOIN records r ON r.kind='block' AND r.id=f.block_id AND r.revision=f.revision
+                        WHERE block_fts MATCH :query AND f.book_id IN :books AND lexical_fp=:fp
+                        AND COALESCE(json_extract(r.data,'$.archived'),0)=0"""
+                        + (" AND f.node_id IN :nodes" if allowed_nodes is not None else "")
+                        + " ORDER BY score, f.block_id LIMIT :n"
+                    ).bindparams(bindparam("books", expanding=True))
+                    parameters: dict[str, Any] = {
+                        "query": expression,
+                        "books": books,
+                        "fp": lexical_fingerprint(),
+                        "n": limit,
+                    }
+                    if allowed_nodes is not None:
+                        statement = statement.bindparams(bindparam("nodes", expanding=True))
+                        parameters["nodes"] = sorted(allowed_nodes)
+                    ranked = [
+                        (row["block_id"], row["score"])
+                        for row in conn.execute(statement, parameters).mappings()
+                        if row["block_id"] in blocks
+                    ]
             output: list[dict[str, Any]] = []
-            for key in selected:
+            for rank, (key, score) in enumerate(ranked, 1):
                 block = blocks[key]
                 book = self.db.get("book", block["book_id"], conn=conn) or {}
                 output.append(
                     {
                         **block,
-                        "score": scores[key],
+                        "score": score,
+                        "method": mode,
+                        "rank": rank,
                         "book_title": book.get("title", ""),
                         "path": node_path(self.db, block.get("node_id"), conn),
-                        "channels": methods[key],
                     }
                 )
             return output
+
+
+def search_limit(db: Database, requested: int | None, *, tool: bool = False) -> int:
+    value = requested if requested is not None else db.settings.search_default_limit
+    maximum = (
+        min(db.settings.search_max_limit, db.settings.tool_search_max_limit)
+        if tool
+        else db.settings.search_max_limit
+    )
+    if not 1 <= value <= maximum:
+        raise ValueError(f"每种检索的输出条数必须在 1 到 {maximum} 之间")
+    return value
+
+
+def vector_blob(values: list[float]) -> bytes:
+    import struct
+
+    if not values or not all(math.isfinite(value) for value in values) or not any(values):
+        raise ValueError("向量必须非空、非零并且只包含有限值")
+    blob = sqlite_vec.serialize_float32(values)
+    narrowed = struct.unpack(f"{len(values)}f", blob)
+    if not all(math.isfinite(value) for value in narrowed) or not any(narrowed):
+        raise ValueError("向量超出 float32 有效范围")
+    return blob

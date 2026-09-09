@@ -16,6 +16,7 @@ from PIL import Image
 from playwright.async_api import Route, async_playwright, expect
 
 from studyquip.ai import MODEL_ROLE_LABELS, ModelProfile
+from studyquip.question_index import PART_LABELS
 
 
 async def verify() -> dict[str, Any]:
@@ -170,6 +171,12 @@ async def verify() -> dict[str, Any]:
         for role in MODEL_ROLE_LABELS
     ]
     responses: dict[str, Any] = {
+        "/api/search/options": {
+            "parts": PART_LABELS,
+            "default_limit": 12,
+            "max_limit": 100,
+            "default_methods": ["keyword"],
+        },
         "/api/session": {"authenticated": True, "initialized": True, "csrf_token": "fixture"},
         "/api/subjects": [{"id": "english", "revision": 1, "name": "英语"}],
         "/api/books": [{"id": "book", "subject_id": "english", "title": "英语必修一", "asset_ids": []}],
@@ -177,6 +184,7 @@ async def verify() -> dict[str, Any]:
         "/api/jobs": [],
         "/api/questions": [question],
         "/api/questions/question": question,
+        "/api/questions/math": math,
         "/api/books/book/nodes": [{"id": "node", "title": "Listening", "parent_id": None}],
         "/api/export-snapshot/practice": practice,
         "/api/export-snapshot/review": review,
@@ -186,6 +194,26 @@ async def verify() -> dict[str, Any]:
 
     async def route_request(route: Route) -> None:
         path = urlsplit(route.request.url).path
+        if path == "/api/search" and route.request.method == "POST":
+            body = route.request.post_data_json
+            writes.append({"path": path, "body": body})
+            await route.fulfill(
+                json=[
+                    {
+                        "id": "part-math",
+                        "question_id": "math",
+                        "question_title": math["stem"],
+                        "text": math["stem"],
+                        "path": [],
+                        "part": "stem",
+                        "part_label": "题干",
+                        "answer_confirmed": True,
+                        "method": body["methods"][0],
+                        "rank": 1,
+                    }
+                ]
+            )
+            return
         if path == "/api/assets/figure/preview":
             await route.fulfill(body=image.getvalue(), content_type="image/png")
             return
@@ -276,11 +304,47 @@ async def verify() -> dict[str, Any]:
             await page.get_by_role("button", name="导出 PDF · 1", exact=True).click()
             await expect(page.locator(".paper-preview")).not_to_contain_text("Let's go to the library.")
             assert await page.locator(".paper-preview audio").count() == 0
+            await page.get_by_text("检索相关题并加入打印", exact=True).click()
+            await expect(page.get_by_role("combobox", name="检索方式", exact=True)).to_have_value("keyword")
+            await page.get_by_role("textbox", name="检索内容", exact=True).fill("平方函数")
+            await page.get_by_role("checkbox", name="解析", exact=True).check()
+            await page.get_by_text("限定题型", exact=False).click()
+            await page.get_by_role("checkbox", name="单选题", exact=True).check()
+            await page.get_by_role("spinbutton", name="每种检索最多返回", exact=True).fill("5")
+            await page.get_by_role("button", name="添加下一种检索", exact=True).click()
+            await page.get_by_role("button", name="交换顺序", exact=True).click()
+            await expect(page.get_by_role("combobox", name="第 1 种检索", exact=True)).to_have_value(
+                "semantic"
+            )
+            await page.get_by_role("button", name="检索", exact=True).click()
+            await page.get_by_role("button", name="加入打印", exact=True).click()
+            await expect(page.locator(".export-order")).to_have_count(2)
+            await expect(page.get_by_role("button", name="已加入", exact=True)).to_be_disabled()
+            query = next(write["body"] for write in reversed(writes) if write["path"] == "/api/search")
+            assert query["methods"] == ["semantic", "keyword"] and query["parts"] == ["stem", "explanation"]
+            assert (
+                query["question_types"] == ["single_choice"]
+                and query["confirmed_only"]
+                and query["limit"] == 5
+            )
+            await page.screenshot(path=str(output / "print-search-mobile.png"), full_page=True)
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             await page.goto("http://studyquip.test/#search")
             await page.get_by_text("限定教材范围", exact=False).click()
             await page.get_by_role("checkbox", name="英语必修一", exact=True).check()
             await page.get_by_role("combobox", name="限定目录", exact=False).select_option("node")
             await page.screenshot(path=str(output / "search-mobile.png"), full_page=True)
+            await page.get_by_role("tab", name="错题", exact=True).click()
+            await page.get_by_role("checkbox", name="答案", exact=True).check()
+            await page.get_by_role("button", name="移除第 2 种检索", exact=True).click()
+            await expect(page.get_by_role("combobox", name="检索方式", exact=True)).to_have_value("semantic")
+            await page.get_by_role("textbox", name="检索内容", exact=True).fill("函数求值")
+            await page.get_by_role("button", name="检索", exact=True).click()
+            await expect(page.get_by_role("link", name="查看题目", exact=True)).to_have_attribute(
+                "href", "#questions?question=math"
+            )
+            await page.evaluate("window.scrollTo(0,0)")
+            await page.screenshot(path=str(output / "question-search-mobile.png"), full_page=True)
             assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             await page.set_viewport_size({"width": 1280, "height": 980})
             for mode in ("practice", "review"):
@@ -323,6 +387,9 @@ async def verify() -> dict[str, Any]:
         "subject_rename_fixture": True,
         "stream_toggle": True,
         "directory_scope": True,
+        "question_section_filters": True,
+        "ordered_search_default_single": True,
+        "print_search_add_deduplicated": True,
         "pdfs": ["practice.pdf", "review.pdf"],
         "font_failure_detected": True,
         "browser_errors": errors,

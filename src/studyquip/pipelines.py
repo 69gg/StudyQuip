@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable
-from typing import Annotated, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
 from sqlalchemy.engine import Connection
@@ -25,6 +25,9 @@ from studyquip.ai import (
 from studyquip.db import ConflictError, Database
 from studyquip.jobs import JobStore, source_fingerprint
 from studyquip.question_tree import FigureSpec, Material, walk_questions
+
+if TYPE_CHECKING:
+    from studyquip.schemas import SearchInput
 
 Json = dict[str, Any]
 
@@ -511,7 +514,7 @@ async def question_extract(ctx: PipelineContext) -> None:
     subjects = await asyncio.to_thread(ctx.db.list, "subject")
     prompt = (
         "整理错题：可以在不改变内容和题意的前提下优化题干、选项的表述，使语言清楚通顺，并规范公式排版。不得解题后改题、纠错、补条件、暗示答案或改变数学含义；保留全部数值、变量、单位、正负号、否定词、条件、选项 ID 与顺序。原表述有歧义时保留并提示核对。已有选项按原 ID 返回全部选项，不新增删除；仅当全部选项为空且尚无答案时可按原图重建。大题 type=composite，parts 可继续嵌套大题，保留已有小题 ID、顺序和层级，不丢弃材料。其余非空字段必须尊重；标准答案只能从参考解析提取，不得用自行推导的答案填 answer_from_reference。不得将图片批注误当题干。\n"
-        "你可以按需使用关键词、向量、混合检索和目录工具理解教材术语与图示，但检索不能成为修改题目条件或编造答案的依据。已有材料足够时直接提交。配图优先返回 rendered_figures：几何/实验示意图用仅含静态元素的安全 SVG；函数与坐标图用 plot 的范围、series.expression（仅 x 和常见数学函数）或 points。不能可靠复刻的复杂插图在 figure_requirements 中说明，请用户上传，不猜画。figure_description 忠实描述已有插图中的标签、数值和关系，供文本讲解模型理解，不额外解题或猜测不清晰的信息。材料 materials 的 kind 为 text 或 listening，保留用户音频 ID 和文稿；不得虚构音频附件。\n"
+        "你可以按需使用独立的关键词或向量检索和目录工具理解教材术语与图示，但检索不能成为修改题目条件或编造答案的依据。已有材料足够时直接提交。配图优先返回 rendered_figures：几何/实验示意图用仅含静态元素的安全 SVG；函数与坐标图用 plot 的范围、series.expression（仅 x 和常见数学函数）或 points。不能可靠复刻的复杂插图在 figure_requirements 中说明，请用户上传，不猜画。figure_description 忠实描述已有插图中的标签、数值和关系，供文本讲解模型理解，不额外解题或猜测不清晰的信息。材料 materials 的 kind 为 text 或 listening，保留用户音频 ID 和文稿；不得虚构音频附件。\n"
         r"在 stem 和 options.text 中使用 Markdown 与 KaTeX 支持的 LaTeX：行内公式用 $...$，独立公式用单独成行的 $$...$$。将含义明确的分数、根号、上下标、向量和化学式规范排版，例如 x^2/2 写为 $\frac{x^2}{2}$，sqrt(x) 写为 $\sqrt{x}$，H2SO4 写为 $\ce{H2SO4}$。化学反应使用 \ce{...}，保留原系数和反应条件，不自行配平。中文叙述放在公式外，不将全文包入公式或代码块；已正确的 LaTeX 不重复包裹。"
         "\n公式含义不明确（例如未注明分母范围的 1/2x）或图片符号不清时，不猜测：已有字段完整保留原文，空字段忠实转录可辨认内容，并在 formatting_issues 中指出位置与问题（field 为 stem 或 option，选项使用原 option_id）。formatting_issues 必须返回列表，无问题返回 []。\n"
         "做错原因 error_reason 和备注 notes 均由用户填写，题目识别不得生成或改写这两个字段。\n"
@@ -577,87 +580,20 @@ def retrieval_tools(
     *,
     context_tokens: int | None = None,
 ) -> dict[str, tuple[str, Json, ToolHandler]]:
-    from studyquip.retrieval import RetrievalService, records
-
-    retrieval = RetrievalService(ctx.db)
+    from studyquip.retrieval import records
 
     async def search(args: Json) -> Any:
-        query = str(args.get("query", ""))
-        mode = args.get("mode", "hybrid")
-        query_vector: list[float] | None = None
-        fingerprint: str | None = None
-        if mode in {"hybrid", "semantic"} and query:
-            profiles = await ctx.ai.profiles()
-            embedding = next((profile for profile in profiles if profile.role == "embedding"), None)
-            if embedding:
-                from studyquip.retrieval import embedding_fingerprint
+        from studyquip.retrieval import search_limit
+        from studyquip.schemas import SearchInput
 
-                cache_key = hashlib.sha256(
-                    (
-                        embedding_fingerprint(embedding.model_dump(), embedding.embedding_dimensions or 0)
-                        + query
-                    ).encode()
-                ).hexdigest()
-                cached = ctx.data.get("query_embeddings", {}).get(cache_key)
-                if cached:
-                    query_vector, fingerprint = cached["vector"], cached["space_fingerprint"]
-                else:
-
-                    async def activity(value: Json) -> None:
-                        await ctx.commit(
-                            {
-                                "embedding_activity": {
-                                    **value,
-                                    "model": embedding.model,
-                                    "revision": embedding.revision,
-                                }
-                            }
-                        )
-
-                    vectors, usage = await ctx.ai.embed(
-                        embedding,
-                        [query],
-                        query=True,
-                        before_request=ctx.guard,
-                        bypass_window=bool(ctx.job.get("bypass_window")),
-                        activity=activity,
-                    )
-                    query_vector = vectors[0]
-                    fingerprint = embedding_fingerprint(embedding.model_dump(), len(query_vector))
-                    await ctx.commit(
-                        {
-                            "query_embeddings": {
-                                **ctx.data.get("query_embeddings", {}),
-                                cache_key: {
-                                    "vector": query_vector,
-                                    "space_fingerprint": fingerprint,
-                                    "usage": usage,
-                                },
-                            },
-                            "query_embedding_usage": {
-                                "requests": ctx.data.get("query_embedding_usage", {}).get("requests", 0) + 1,
-                                "input_tokens": ctx.data.get("query_embedding_usage", {}).get(
-                                    "input_tokens", 0
-                                )
-                                + (usage.get("prompt_tokens", 0) or 0),
-                            },
-                            "embedding_activity": None,
-                        }
-                    )
-            elif mode == "semantic":
-                raise ValueError("尚未配置嵌入模型，无法执行纯向量检索")
-        return await asyncio.to_thread(
-            retrieval.search,
-            query,
-            book_ids=book_ids,
-            subject_id=subject_id,
-            node_id=args.get("node_id"),
-            mode=mode,
-            keyword_mode=args.get("keyword_mode", "any"),
-            limit=min(int(args.get("limit", 12)), 30),
-            query_vector=query_vector,
-            space_fingerprint=fingerprint,
+        request = SearchInput.model_validate(
+            {**args, "target": "book", "book_ids": book_ids, "subject_id": subject_id}
         )
+        search_limit(ctx.db, request.limit, tool=True)
+        # An empty authorized book scope must never expand to all books.
+        if not book_ids:
+            return []
+        return await execute_search(ctx, request)
 
     async def browse(args: Json) -> Any:
         kind = args.get("kind", "node")
@@ -742,15 +678,24 @@ def retrieval_tools(
     integer = {"type": "integer"}
     return {
         "search_textbook": (
-            "在允许的教材范围内检索，支持关键词、短语、语义、混合和指定目录子树。",
+            "在允许的教材范围内执行独立的关键词或向量检索。默认仅关键词；methods 可指定一种或按先后顺序指定两种，后者只按顺序追加去重，不混合打分。关键词支持 any/all/phrase；limit 是每种方式输出条数上限。可限定目录子树。",
             {
                 "type": "object",
                 "properties": {
                     "query": string,
-                    "mode": {"enum": ["hybrid", "keyword", "phrase", "semantic"], "type": "string"},
-                    "keyword_mode": {"enum": ["any", "all"], "type": "string"},
+                    "methods": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["keyword", "semantic"]},
+                        "minItems": 1,
+                        "maxItems": 2,
+                    },
+                    "keyword_mode": {"enum": ["any", "all", "phrase"], "type": "string"},
                     "node_id": {"type": ["string", "null"]},
-                    "limit": integer,
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": min(ctx.settings.search_max_limit, ctx.settings.tool_search_max_limit),
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -827,13 +772,13 @@ async def question_explain(ctx: PipelineContext) -> None:
     async def explain(node: Json, ancestors: list[Json]) -> tuple[str, ExplanationDraft, bool]:
         optimize = bool(node.get("optimize_error_reason") and node.get("error_reason", "").strip())
         initial = (
-            await tools["search_textbook"][2]({"query": node.get("stem", ""), "mode": "hybrid"})
+            await tools["search_textbook"][2]({"query": node.get("stem", ""), "methods": ["keyword"]})
             if book_ids
             else []
         )
         prompt = (
             "为这道已确认答案的错题生成讲解、分步分析和知识点。结合祖先大题的题干和材料理解当前小题；"
-            "标准答案由用户确认，不得替换，冲突写入 answer_conflict。可自行调用关键词、向量、混合检索、目录及正文工具寻找依据。"
+            "标准答案由用户确认，不得替换，冲突写入 answer_conflict。可自行调用独立的关键词或向量检索、目录及正文工具寻找依据。"
             "优先使用参考解析和教材证据，引用只显示书名及实际目录路径，不显示教材页码。"
             "没有命中原文时 citations 留空；引文必须包含原文、块 ID 和当前 revision。不要臆测无法看到的插图。\n"
             "error_reason 是用户自述的做错原因，原文和备注不可改写。仅当 error_reason_optimization_enabled "
@@ -1779,22 +1724,177 @@ async def suggestion_regenerate(ctx: PipelineContext) -> None:
     await ctx.finish({"suggestion_id": suggestion["id"], "operation_group_id": group_id}, write)
 
 
+async def query_embedding(ctx: PipelineContext, query: str) -> tuple[list[float], str]:
+    from studyquip.retrieval import embedding_fingerprint
+
+    embedding = await ctx.ai.profile_for("embedding")
+    space = embedding_fingerprint(embedding.model_dump(), embedding.embedding_dimensions or 0)
+    cache_key = hashlib.sha256((space + query).encode()).hexdigest()
+    cached = ctx.data.get("query_embeddings", {}).get(cache_key)
+    if cached:
+        return cached["vector"], cached["space_fingerprint"]
+
+    async def activity(value: Json) -> None:
+        await ctx.commit(
+            {"embedding_activity": {**value, "model": embedding.model, "revision": embedding.revision}}
+        )
+
+    vectors, usage = await ctx.ai.embed(
+        embedding,
+        [query],
+        query=True,
+        before_request=ctx.guard,
+        bypass_window=bool(ctx.job.get("bypass_window")),
+        activity=activity,
+    )
+    latest = await ctx.ai.profile_for("embedding")
+    if embedding_fingerprint(latest.model_dump(), latest.embedding_dimensions or 0) != space:
+        from studyquip.scheduling import WindowClosed
+
+        raise WindowClosed(time.time(), "嵌入空间配置已变化，按最新配置重新检索")
+    fingerprint = embedding_fingerprint(embedding.model_dump(), len(vectors[0]))
+    previous = ctx.data.get("query_embedding_usage", {})
+    await ctx.commit(
+        {
+            "query_embeddings": {
+                **ctx.data.get("query_embeddings", {}),
+                cache_key: {"vector": vectors[0], "space_fingerprint": fingerprint},
+            },
+            "query_embedding_usage": {
+                "requests": previous.get("requests", 0) + 1,
+                "input_tokens": previous.get("input_tokens", 0) + (usage.get("prompt_tokens", 0) or 0),
+            },
+            "embedding_activity": None,
+        }
+    )
+    return vectors[0], fingerprint
+
+
+async def execute_search(ctx: PipelineContext, request: "SearchInput") -> list[Json]:
+    from studyquip.search import append_stage, current_hits, search_stage
+
+    candidates: list[Json] = []
+    for step, method in enumerate(request.methods, 1):
+        await ctx.guard()
+        vector, fingerprint = (
+            await query_embedding(ctx, request.query)
+            if method == "semantic" and request.query.strip()
+            else (None, None)
+        )
+        hits = await asyncio.to_thread(
+            search_stage, ctx.db, request, method, query_vector=vector, space_fingerprint=fingerprint
+        )
+        candidates.extend({**hit, "step": step} for hit in hits)
+    valid = await asyncio.to_thread(current_hits, ctx.db, request, candidates)
+    output: list[Json] = []
+    for hit in valid:
+        append_stage(output, [hit], hit["step"])
+    return output
+
+
 async def search_job(ctx: PipelineContext) -> None:
-    from studyquip.retrieval import RetrievalService
+    from studyquip.schemas import SearchInput
 
     query = await asyncio.to_thread(ctx.db.get, "search", ctx.job["resource_id"])
     if query is None:
         raise ValueError("搜索任务输入不存在")
-    retrieval = RetrievalService(ctx.db)
+    request = SearchInput.model_validate(query)
+    hits = await execute_search(ctx, request)
+    await ctx.finish({"hits": hits, "methods": request.methods})
 
-    def scope() -> list[str]:
-        with ctx.db.read() as conn:
-            return retrieval.scoped_books(query.get("book_ids") or None, query.get("subject_id"), conn)
 
-    books = await asyncio.to_thread(scope)
-    tools = retrieval_tools(ctx, books, query.get("subject_id"))
-    hits = await tools["search_textbook"][2](query)
-    await ctx.finish({"hits": hits})
+async def question_index(ctx: PipelineContext) -> None:
+    from studyquip.question_index import QuestionIndex
+    from studyquip.retrieval import embedding_fingerprint
+    from studyquip.scheduling import WindowClosed
+
+    service = QuestionIndex(ctx.db)
+    question_id = ctx.job["resource_id"]
+    # The index follows the latest sections; it never writes a question revision.
+    while True:
+
+        def snapshot() -> tuple[Json | None, list[Json], int]:
+            with ctx.db.read() as conn:
+                profile = service.profile(conn)
+                targets, _ = service.eligible(conn, question_id)
+                return profile, service.pending(question_id, profile, conn) if profile else [], len(targets)
+
+        profile_data, pending, total = await asyncio.to_thread(snapshot)
+        completed = total - len(pending) if profile_data else 0
+        await ctx.commit(
+            {
+                "phase": "更新题目分部向量索引" if profile_data else "等待配置嵌入模型",
+                "embedding_total": total,
+                "embedding_completed": completed,
+            }
+        )
+        space = (
+            embedding_fingerprint(profile_data, profile_data.get("embedding_dimensions") or 0)
+            if profile_data
+            else None
+        )
+        if not profile_data or not pending:
+
+            def finish_latest(conn: Connection) -> None:
+                latest = service.profile(conn)
+                if latest and service.pending(question_id, latest, conn):
+                    raise WindowClosed(time.time(), "题目或嵌入配置已更新，继续补齐最新部分")
+
+            await ctx.finish(
+                {"question_id": question_id, "embedding_configured": bool(profile_data)}, finish_latest
+            )
+            return
+        profile = ModelProfile.model_validate(profile_data)
+        batch: list[Json] = []
+        for part in pending:
+            if batch and (
+                len(batch) >= ctx.settings.question_embedding_batch_size
+                or (
+                    profile.context_tokens is not None
+                    and estimate_tokens([item["text"] for item in [*batch, part]]) > profile.context_tokens
+                )
+            ):
+                break
+            batch.append(part)
+
+        async def activity(value: Json) -> None:
+            await ctx.commit(
+                {"embedding_activity": {**value, "model": profile.model, "revision": profile.revision}}
+            )
+
+        async def before_embedding() -> None:
+            await ctx.guard()
+            latest = await ctx.ai.profile_for("embedding")
+            if embedding_fingerprint(latest.model_dump(), latest.embedding_dimensions or 0) != space:
+                raise WindowClosed(time.time(), "嵌入空间已变化，按最新配置继续题目索引")
+
+        vectors, usage = await ctx.ai.embed(
+            profile,
+            [part["text"] for part in batch],
+            before_request=before_embedding,
+            bypass_window=bool(ctx.job.get("bypass_window")),
+            activity=activity,
+        )
+        fingerprint = embedding_fingerprint(profile_data, len(vectors[0]))
+
+        def publish(conn: Connection) -> None:
+            latest = service.profile(conn)
+            if not latest or embedding_fingerprint(latest, latest.get("embedding_dimensions") or 0) != space:
+                return  # Count the completed request, discard its obsolete space, then re-plan.
+            for part, vector in zip(batch, vectors, strict=True):
+                service.store(part, fingerprint, vector, conn)
+
+        previous = ctx.data.get("embedding_usage", {})
+        await ctx.commit(
+            {
+                "embedding_activity": None,
+                "embedding_usage": {
+                    "requests": previous.get("requests", 0) + 1,
+                    "input_tokens": previous.get("input_tokens", 0) + (usage.get("prompt_tokens", 0) or 0),
+                },
+            },
+            publish,
+        )
 
 
 HANDLERS: dict[str, Callable[[PipelineContext], Any]] = {
@@ -1805,6 +1905,7 @@ HANDLERS: dict[str, Callable[[PipelineContext], Any]] = {
     "book_process": book_process,
     "page_recognize": page_recognize,
     "book_index": book_index,
+    "question_index": question_index,
     "suggestion_regenerate": suggestion_regenerate,
     "export_pdf": export_pdf,
     "search": search_job,

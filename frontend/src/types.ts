@@ -247,6 +247,7 @@ export const jobKindLabels: Record<string, string> = {
   book_process: "整理教材",
   page_recognize: "识别教材页",
   book_index: "建立教材索引",
+  question_index: "更新题目向量索引",
   suggestion_regenerate: "重新生成修改建议",
   export_pdf: "导出 PDF",
   search: "检索教材",

@@ -983,7 +983,7 @@ async def test_unlimited_summary_and_embedding_batches_do_not_reuse_old_partial_
         assert {item["node_id"]: item["text"] for item in summary_inputs[0]} == sources
         assert all(db.get("node", node_id)["summary"] == "新完整概述" for node_id in sources)
         assert len(embedding_inputs) == 1
-        assert all(source in embedding_inputs[0] for source in sources.values())
+        assert sorted(embedding_inputs[0]) == sorted(sources.values())  # No unused directory vectors.
     finally:
         db.close()
 

@@ -29,16 +29,11 @@ class Settings(BaseSettings):
     max_pdf_pages: int = Field(2000, ge=1)
     max_image_pixels: int = Field(80_000_000, ge=1)
     timezone: str = "Asia/Shanghai"
-    directory_candidates: int = Field(4, ge=1)
-    global_candidates: int = Field(20, ge=1)
-    subtree_candidates: int = Field(6, ge=1)
-    final_blocks: int = Field(12, ge=1)
-    rrf_k: int = Field(60, ge=1)
-    dense_weight: float = Field(1, ge=0)
-    lexical_weight: float = Field(1, ge=0)
-    directory_weight: float = Field(0.5, ge=0)
-    relation_weight: float = Field(0.5, ge=0)
-    relation_hops: int = Field(2, ge=0)
+    search_default_limit: int = Field(12, ge=1)
+    search_max_limit: int = Field(100, ge=1)
+    tool_search_max_limit: int = Field(30, ge=1)
+    question_embedding_batch_size: int = Field(8, ge=1)
+    question_index_debounce_seconds: float = Field(2, ge=0)
     block_relation_limit: int = Field(3, ge=0)
     concept_relation_limit: int = Field(6, ge=0)
     node_relation_limit: int = Field(12, ge=0)
@@ -46,6 +41,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_timing(self) -> "Settings":
+        if self.search_default_limit > min(self.search_max_limit, self.tool_search_max_limit):
+            raise ValueError("默认检索条数不能超过 Web 或工具的检索上限")
         if self.heartbeat_seconds >= self.lease_seconds / 2:
             raise ValueError("heartbeat_seconds 必须小于 lease_seconds 的一半")
         self.data_dir = self.data_dir.expanduser().resolve()

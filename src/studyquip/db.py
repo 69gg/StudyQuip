@@ -36,7 +36,7 @@ from sqlalchemy.pool import NullPool
 from .config import Settings
 from .doctor import require_runtime
 
-SCHEMA_REVISION = "0001"
+SCHEMA_REVISION = "0002"
 metadata = MetaData()
 records = Table(
     "records",
@@ -200,6 +200,10 @@ class Database:
         conn.execute(
             record_history.insert().values(kind=kind, id=record_id, revision=revision, snapshot=snapshot)
         )
+        if kind == "question":
+            from .question_index import QuestionIndex
+
+            QuestionIndex(self).sync(snapshot, conn)
         return snapshot
 
     def delete(self, kind: str, id: str, *, conn: Connection | None = None) -> None:
@@ -208,6 +212,10 @@ class Database:
                 self.delete(kind, id, conn=active)
             return
         conn.execute(records.delete().where(and_(records.c.kind == kind, records.c.id == id)))
+        if kind == "question":
+            from .question_index import QuestionIndex
+
+            QuestionIndex(self).sync({"id": id, "deleted": True}, conn)
 
     def history(self, kind: str, id: str, conn: Connection | None = None) -> list[dict[str, Any]]:
         if conn is None:

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from playwright.async_api import Route, async_playwright, expect
 
 from studyquip.ai import MODEL_ROLE_LABELS, ModelProfile
+from studyquip.question_index import PART_LABELS
 
 
 async def verify() -> dict[str, Any]:
@@ -113,10 +114,21 @@ async def verify() -> dict[str, Any]:
         }
     )
     search_job = job("search", "search-input")
-    search_job["input"] = {"query": "惯性", "mode": "hybrid", "book_ids": ["book"], "subject_id": "subject"}
+    search_job["input"] = {
+        "query": "惯性",
+        "methods": ["keyword"],
+        "book_ids": ["book"],
+        "subject_id": "subject",
+    }
     export_job = {**job("export_pdf", "export"), "question_ids": ["question"]}
     jobs = [book_job, job("question_explain", "question"), job("model_test", "model"), search_job, export_job]
     responses: dict[str, Any] = {
+        "/api/search/options": {
+            "parts": PART_LABELS,
+            "default_limit": 12,
+            "max_limit": 100,
+            "default_methods": ["keyword"],
+        },
         "/api/session": {"authenticated": True, "initialized": True, "csrf_token": "fixture"},
         "/api/subjects": [subject],
         "/api/books": [book],
