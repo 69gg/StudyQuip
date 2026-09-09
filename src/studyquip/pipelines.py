@@ -11,7 +11,17 @@ import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 from sqlalchemy.engine import Connection
 
 from studyquip.ai import (
@@ -21,6 +31,7 @@ from studyquip.ai import (
     ToolHandler,
     estimate_tokens,
     tool_definition,
+    validation_feedback,
 )
 from studyquip.db import ConflictError, Database
 from studyquip.jobs import JobStore, source_fingerprint
@@ -212,6 +223,14 @@ class RelationDraft(Structured):
     type: str
     evidence: EvidenceDraft
 
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def unwrap_evidence(cls, value: Any) -> Any:
+        # A single object wrapper is lossless; never infer missing IDs or quotes.
+        if isinstance(value, dict) and set(value) == {"item"} and isinstance(value["item"], dict):
+            return value["item"]
+        return value
+
 
 def operation_schema(schema: Json) -> None:
     # Literal op values are disjoint. Keep the existing provider-facing anyOf schema
@@ -237,9 +256,42 @@ class RevisionDraft(Structured):
     working_summary: str
     current_node_id: str | None = None
     open_anchors: ModelList[str] = Field(default_factory=list)
-    concepts: ModelList[ConceptDraft] = Field(default_factory=list)
-    relations: ModelList[RelationDraft] = Field(default_factory=list)
+    concepts: ModelList[ConceptDraft] = Field(
+        default_factory=list,
+        description="可选学科概念。仅顺带提取有原文证据的内容，否则返回 []；不为此额外检索。",
+    )
+    relations: ModelList[RelationDraft] = Field(
+        default_factory=list,
+        description="可选关系对象列表。每项须含 source_id、target_id、type 和 evidence 对象；"
+        "端点是已存在或本次新建的 ID，不是名称。无可核验的关系返回 []，正文整理优先。",
+    )
     closed_node_ids: ModelList[str] = Field(default_factory=list)
+
+    @field_validator("concepts", "relations", mode="wrap")
+    @classmethod
+    def validate_enrichment(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> Any:
+        # Only the AI acceptance path supplies an audit collector. Other callers
+        # keep normal strict validation; the advertised tool schema stays typed.
+        if not isinstance(info.context, dict) or "rejections" not in info.context:
+            return handler(value)
+        decoded = decode_model_list(value)
+        valid: list[Any] = []
+        candidates = list(enumerate(decoded)) if isinstance(decoded, list) else [(None, decoded)]
+        for index, item in candidates:
+            try:
+                valid.extend(handler([item] if index is not None else item))
+            except ValidationError as error:
+                info.context["rejections"].append(
+                    {
+                        "kind": "concept" if info.field_name == "concepts" else "relation",
+                        "index": index,
+                        "proposal": item,
+                        "reason": validation_feedback(error),
+                    }
+                )
+        return valid
 
 
 class SummaryItem(Structured):
@@ -1179,6 +1231,25 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
         unit_index=0,
         unit_budget=unit_budget,
     )
+    if not first_context["library"]["active_blocks"]:
+        # There is no committed text to read/search yet. A complete supplied
+        # outline also removes the need to browse an otherwise empty library.
+        tools = (
+            {"browse_textbook": tools["browse_textbook"]}
+            if first_context["outline_partial"]
+            or len(first_context["outline"]) < first_context["library"]["directory_nodes"]
+            else {}
+        )
+        definitions = [
+            definitions[0],
+            *(
+                tool_definition(name, description, schema, profile)
+                for name, (description, schema, _) in tools.items()
+            ),
+        ]
+        first_context = await asyncio.to_thread(
+            builder.build, book["id"], page["id"], tools=definitions, unit_budget=unit_budget
+        )
     unit_budget = first_context["current_page"]["unit_budget"]
     if not plan:
         await ctx.commit(
@@ -1212,10 +1283,18 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
         unit_count = context["current_page"].get("unit_count", 1)
         prompt = (
             "current_page.text 就是本次处理单元的草稿，无需再用工具读取当前页。"
+            "previous_blocks 是服务端本轮已读取的最新正式块，可直接使用其中的 ID、正文和版本做跨页续接，"
+            "不必为确认版本再次读取。只有修改未提供的远处正文，或原文被明确省略时，才使用工具读取。"
             "current_page.id 是原页 ID，只用于 source_page_ids；ancestors/outline 中的 ID 是目录 ID，"
             "两者都不能作为 read_block.block_id。只新增正文且上下文已足够时直接提交，"
             "仅在确实缺少依据或需要修改已有正文时使用读取工具；不要为完成流程反复浏览同一目录。"
-            "按原始顺序把当前教材草稿修订为正式文章。目录可以任意深度，保留真实标题，不硬编码章节。使用块级操作，修改前文必须读取最新块及版本；摘要不能代替原文。新目录和新块使用新唯一 ID；现有 ID 来自上下文或工具。当前页续接前页可合并，保留最前块 ID。遇到跳过缺口禁止拼句或补造目录。人工保护块只能形成建议，但当前页新正文必须先独立插入。每个内容块尽量是一段话，插图描述和侧栏为独立块。提交工作摘要和未闭合锚点，不重复整本前文。概念、别名和关系可随本次提取，但必须引用实际块版本与原文；新插入块版本为 1。无证据留空。只在当前单元末尾关闭确实结束的目录节点。\n"
+            "按原始顺序把当前教材草稿修订为正式文章。目录可以任意深度，保留真实标题，不硬编码章节。使用块级操作，修改前文须以本轮提供或工具读取的最新块及版本为准；摘要不能代替原文。新目录和新块使用新唯一 ID；现有 ID 来自上下文或工具。当前页续接前页可合并，保留最前块 ID。遇到跳过缺口禁止拼句或补造目录。人工保护块只能形成建议，但当前页新正文必须先独立插入。每个内容块尽量是一段话，插图描述和侧栏为独立块。提交简短工作摘要和未闭合锚点，不重复整本前文。"
+            "正文整理是本轮主要目标。concepts 和 relations 均可返回 []；只顺带提取明确的学科概念，"
+            "不为凑齐附加字段追加检索。封面、版权、目录只保留可见信息和实际目录，"
+            "不把出版社、奖项、封面装饰建成学科概念或关系。"
+            "证据必须引用实际块版本与原文，新插入块版本为 1；关系端点使用概念/块/目录 ID 而非名称。"
+            "每条关系是完整对象，evidence 直接使用 {block_id, revision, quote}，不能拆成散落的字符串。"
+            "无可验证证据留空。只在当前单元末尾关闭确实结束的目录节点。\n"
             + json.dumps(context, ensure_ascii=False)
         )
         receipt: Json = {}
@@ -1250,6 +1329,21 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
                     conn=conn,
                 )
                 if answer["status"] == "accepted":
+                    enrichment = {"concepts": 0, "relations": 0, "rejected": 0}
+                    for rejection in ctx.data["stages"][stage].get("validation_rejections", []):
+                        ctx.db.put(
+                            "relation_rejection",
+                            {
+                                "book_id": book["id"],
+                                "page_id": page["id"],
+                                "operation_group_id": group_id,
+                                "valid": False,
+                                "validation": "format",
+                                **rejection,
+                            },
+                            conn=conn,
+                        )
+                        enrichment["rejected"] += 1
                     for concept in draft.concepts:
                         data = concept.model_dump(exclude_none=True)
                         for evidence in data["evidence"]:
@@ -1258,6 +1352,7 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
                         try:
                             service.record_concept(book["id"], data, conn=conn)
                         except ValueError as error:
+                            enrichment["rejected"] += 1
                             ctx.db.put(
                                 "relation_rejection",
                                 {
@@ -1268,10 +1363,14 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
                                 },
                                 conn=conn,
                             )
+                        else:
+                            enrichment["concepts"] += 1
                     for relation in draft.relations:
                         data = relation.model_dump(exclude_none=True)
                         data["evidence"] = [data["evidence"]]
-                        service.record_relation(book["id"], data, conn=conn)
+                        relation_result = service.record_relation(book["id"], data, conn=conn)
+                        enrichment["relations" if relation_result.get("valid") else "rejected"] += 1
+                    return {**answer, "enrichment": enrichment}
                 return answer
 
             def progress(answer: Json) -> Json:
@@ -1282,6 +1381,10 @@ async def _revise_page(ctx: PipelineContext, book: Json, page: Json, profile: Mo
                     "closed_node_ids": list(
                         dict.fromkeys([*ctx.data.get("closed_node_ids", []), *draft.closed_node_ids])
                     ),
+                    "enrichment": {
+                        name: ctx.data.get("enrichment", {}).get(name, 0) + count
+                        for name, count in answer.get("enrichment", {}).items()
+                    },
                 }
 
             receipt = await ctx.commit(

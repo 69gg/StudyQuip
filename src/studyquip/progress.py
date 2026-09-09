@@ -72,12 +72,14 @@ class JobProgress:
         stages = checkpoint.get("stages", {})
         usage: Counter[str] = Counter()
         active: list[dict[str, Any]] = []
+        tool_events: list[dict[str, Any]] = []
         book = self.book(book_id) if book_id else {}
         for key, state in stages.items():
             usage.update(state.get("usage", {}))
+            parts = key.split(":")
+            page = book.get("page_numbers", {}).get(parts[1]) if len(parts) > 1 else None
+            tool_events.extend({**event, "page": page} for event in state.get("tool_events", []))
             if "result" not in state and state.get("activity"):
-                parts = key.split(":")
-                page = book.get("page_numbers", {}).get(parts[1]) if len(parts) > 1 else None
                 active.append({**state["activity"], "page": page, "rounds": state.get("rounds", 0)})
         usage.update(checkpoint.get("embedding_usage", {}))
         usage.update(checkpoint.get("query_embedding_usage", {}))
@@ -110,6 +112,11 @@ class JobProgress:
             "completed_stages": sum("result" in state for state in stages.values()),
             "usage": dict(usage),
             "active_requests": active,
+            "tool_events": sorted(tool_events, key=lambda event: event["at"])[
+                -self.db.settings.task_activity_history_size :
+            ],
+            "tool_errors": sum(state.get("tool_errors", 0) for state in stages.values()),
+            "enrichment": checkpoint.get("enrichment", {}),
             "last_activity_at": checkpoint.get("last_activity_at", job["updated_at"]),
         }
         if checkpoint.get("embedding_activity"):

@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, post } from "./api";
-import { jobKindLabels, type Job } from "./types";
+import { jobKindLabels, type Job, type RequestActivity } from "./types";
 import { Badge, Button, ScheduleDialog, formatTime } from "./ui";
 
 const POLL_INTERVAL_MS = 3000;
@@ -160,6 +160,91 @@ export function useResourceJobs(
     blocked: !state.ready || !!state.error || jobs.some(isActiveJob),
   };
 }
+const toolLabels: Record<string, string> = {
+  submit_result: "提交整理结果",
+  read_block: "读取教材正文",
+  browse_textbook: "查看教材目录与概念",
+  search_textbook: "检索教材",
+};
+function RequestProgress({ request: r }: { request: RequestActivity }) {
+  const now = Date.now() / 1000;
+  const state =
+    r.state === "requesting"
+      ? (
+          {
+            thinking: "模型正在思考",
+            arguments: "正在生成工具参数",
+            content: "正在接收内容",
+          } as Record<string, string>
+        )[r.stream_phase || ""] ||
+        (r.streaming ? "等待流式内容" : "等待模型响应")
+      : (
+          {
+            waiting_capacity: "等待并发名额",
+            retrying: "等待重试",
+            tools: "正在执行工具",
+            failed: "请求失败",
+          } as Record<string, string>
+        )[r.state] || r.state;
+  return (
+    <div className="request-detail">
+      <p>
+        {r.page ? `原页 ${r.page} · ` : ""}
+        {state}
+        {r.state === "tools" && r.tool_name
+          ? `：${toolLabels[r.tool_name] || r.tool_name}`
+          : ""}
+        {typeof r.rounds === "number"
+          ? ` · 第 ${r.rounds + (r.state === "tools" ? 0 : 1)} 轮`
+          : ""}
+        {r.at ? ` · ${Math.max(0, Math.floor(now - r.at))} 秒` : ""}
+      </p>
+      <p className="hint">
+        {r.model}（配置版本 {r.revision}）
+        {r.attempt ? ` · 本轮第 ${r.attempt} 次请求` : ""}
+        {r.attempt && r.attempt > 1
+          ? `（网络重试 ${r.attempt - 1}/${r.retry_limit ?? "—"}）`
+          : ""}
+        {r.format_attempt
+          ? ` · 结果格式修复 ${r.format_attempt}/${r.format_limit}`
+          : ""}
+        {r.state === "retrying" && r.next_at
+          ? ` · ${Math.max(0, Math.ceil(r.next_at - now))} 秒后重试`
+          : ""}
+      </p>
+      {r.last_failure && (
+        <p className="hint">上次请求：{r.last_failure.reason}</p>
+      )}
+      {r.state === "retrying" &&
+        r.reason &&
+        r.reason !== r.last_failure?.reason && (
+          <p className="hint">{r.reason}</p>
+        )}
+      {r.streaming && r.state === "requesting" && (
+        <p className="stream-progress">
+          {r.first_received_at ? (
+            <>
+              已接收 {r.received_events || 0} 个事件 · 正文{" "}
+              {r.output_characters || 0} 字符 · 思考{" "}
+              {r.reasoning_characters || 0} 字符 · 工具参数{" "}
+              {r.tool_argument_characters || 0} 字符
+              {r.at
+                ? ` · 首次接收 ${Math.max(0, Math.round(r.first_received_at - r.at))} 秒`
+                : ""}
+              {r.last_received_at
+                ? ` · 距上次接收 ${Math.max(0, Math.floor(now - r.last_received_at))} 秒`
+                : ""}
+              {!!r.tool_names?.length &&
+                ` · 工具：${r.tool_names.map((name) => toolLabels[name] || name).join("、")}`}
+            </>
+          ) : (
+            "等待首个流式事件"
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
 export function JobProgress({
   job,
   detailed = false,
@@ -237,6 +322,16 @@ export function JobProgress({
           个等待重试
         </p>
       )}
+      {working &&
+        (detailed ? requests : requests.slice(0, 1)).map((request, index) => (
+          <RequestProgress key={index} request={request} />
+        ))}
+      {!!p?.enrichment?.rejected && (
+        <p className="hint" role="status">
+          已保存正文；{p.enrichment.rejected}{" "}
+          条概念或关系未通过校验，已单独记录，不影响继续整理。
+        </p>
+      )}
       {job.not_before &&
       job.not_before > Date.now() / 1000 &&
       isActiveJob(job) ? (
@@ -261,58 +356,39 @@ export function JobProgress({
       {detailed && (
         <>
           <p className="hint">
-            执行尝试 {job.attempts || 0} 次 · 已完成处理单元{" "}
-            {p?.completed_units || p?.completed_stages || 0}
+            执行尝试 {job.attempts || 0} 次 · 已完成
+            {job.kind === "book_process"
+              ? `正文单元 ${p?.completed_units || 0}`
+              : `处理阶段 ${p?.completed_stages || 0}`}
           </p>
           <p className="hint">
             已记录用量：{p?.usage?.requests || 0} 次返回 · 输入{" "}
             {p?.usage?.input_tokens || 0} tokens · 输出{" "}
             {p?.usage?.output_tokens || 0} tokens
           </p>
-          {working &&
-            requests.map((r, i) => (
-              <p className="request-detail" key={i}>
-                {r.page ? `原页 ${r.page} · ` : ""}
-                {r.model}（配置版本 {r.revision}） ·{" "}
-                {(
-                  {
-                    requesting: "等待模型返回",
-                    waiting_capacity: "等待并发名额",
-                    retrying: "等待重试",
-                    tools: "处理工具结果",
-                  } as Record<string, string>
-                )[r.state] || r.state}
-                {r.format_attempt
-                  ? ` · 格式重试 ${r.format_attempt}/${r.format_limit}`
-                  : ""}
-                {r.state === "retrying" && r.reason ? ` · ${r.reason}` : ""}
-                {r.at
-                  ? ` · ${Math.max(0, Math.floor(Date.now() / 1000 - r.at))} 秒`
-                  : ""}
-                {r.streaming && (
-                  <span className="stream-progress">
-                    {r.first_received_at ? (
-                      <>
-                        已接收 {r.received_events || 0} 个事件 · 正文{" "}
-                        {r.output_characters || 0} 字符 · 思考{" "}
-                        {r.reasoning_characters || 0} 字符 · 工具参数{" "}
-                        {r.tool_argument_characters || 0} 字符
-                        {r.at
-                          ? ` · 首次接收 ${Math.max(0, Math.round(r.first_received_at - r.at))} 秒`
-                          : ""}
-                        {r.last_received_at
-                          ? ` · 距上次接收 ${Math.max(0, Math.floor(Date.now() / 1000 - r.last_received_at))} 秒`
-                          : ""}
-                        {!!r.tool_names?.length &&
-                          ` · 工具：${r.tool_names.join("、")}`}
-                      </>
-                    ) : (
-                      "流式连接已建立，等待首个事件"
-                    )}
-                  </span>
-                )}
-              </p>
-            ))}
+          {!!p?.tool_events?.length && (
+            <details className="task-activity">
+              <summary>
+                最近工具活动
+                {p.tool_errors ? ` · ${p.tool_errors} 次调用需调整` : ""}
+              </summary>
+              <ol>
+                {p.tool_events.map((event, index) => (
+                  <li key={index}>
+                    <span>
+                      {event.page ? `原页 ${event.page} · ` : ""}第{" "}
+                      {event.round} 轮 · {toolLabels[event.name] || event.name}
+                    </span>
+                    <span className="hint">
+                      {event.status === "error" ? "需调整调用" : "已完成"} ·{" "}
+                      {event.duration_seconds} 秒 · {formatTime(event.at)}
+                    </span>
+                    {event.reason && <p className="hint">{event.reason}</p>}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
           {p?.last_activity_at && (
             <p className="hint">
               最近处理活动：{formatTime(p.last_activity_at)}

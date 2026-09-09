@@ -127,10 +127,28 @@ class ContextBuilder:
             if gap is not None:
                 adjacent_pages = adjacent_pages[gap + 1 :]
             near_ids = {item["id"] for item in adjacent_pages} | {page_id}
-            blocks = [
+            active_blocks = [
                 block
                 for block in records(self.db, "block", {"book_id": book_id}, conn)
-                if not block.get("archived") and near_ids.intersection(block.get("source_page_ids", []))
+                if not block.get("archived")
+            ]
+            blocks = [
+                {
+                    key: block[key]
+                    for key in (
+                        "id",
+                        "revision",
+                        "text",
+                        "node_id",
+                        "type",
+                        "order",
+                        "source_page_ids",
+                        "human_protected",
+                    )
+                    if key in block
+                }
+                for block in active_blocks
+                if near_ids.intersection(block.get("source_page_ids", []))
             ]
             blocks.sort(key=lambda item: (item.get("order", 0), item["id"]))
             sibling_ids = {item["id"] for item in chain}
@@ -164,6 +182,7 @@ class ContextBuilder:
                 "ancestors": chain,
                 "outline": outline,
                 "outline_partial": False,
+                "library": {"active_blocks": len(active_blocks), "directory_nodes": len(nodes)},
                 "current_page": {
                     "id": page_id,
                     "index": page.get("index", page.get("page_index", position)),
@@ -194,6 +213,7 @@ class ContextBuilder:
                 "read_limits": {
                     "max_result_tokens": self.token_budget,
                     "must_read_latest_before_edit": True,
+                    "provided_blocks_are_current": True,
                 },
             }
 

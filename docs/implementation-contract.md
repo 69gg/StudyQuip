@@ -22,7 +22,11 @@
 
 `RevisionDraft.operations` 通过 `op` 判别联合类型；`operation_schema` 保留发往服务商的 `anyOf` 结构。AI 结果数组共用 `ModelList[T]`／`decode_model_list`：仅解码单键 `item` 包装和标准 JSON 数组字符串，再验证全部元素；其他类型错误不猜测修复。无名 `Annotated` 类型别名保持原有 JSON Schema，不修改普通字符串或 HTTP 业务输入。`validation_feedback` 输出字段路径、错误信息与类型，省略原始参数和错误文档链接。活动投影另有 `format_attempt/format_limit/reason`，供现有任务界面展示。
 
-独立结果提交在校验前保存 `rejected_result:{call_id,name,arguments}`，错误反馈和候选按既有检查点提交；更新回复到达后清除旧候选。`rejected_result(state,protocol)` 拒绝未完成批次，兼容从旧 Chat 末尾的独立提交／匹配错误反馈重建候选。显式继续并确认模型、工具定义兼容后，先重新解析最后候选；成功则记录 `result_recovered_from_call_id` 并进入既有业务提交，失败继续原重试协议。原始转录、累计用量不变；原页版本、输入指纹、操作回执和租约仍逐层校验。配置／工具结构变化时连同旧协议清除候选，不以旧结果替代新模型运行。
+独立结果提交在校验前保存 `rejected_result:{call_id,name,arguments}`，错误反馈和候选按既有检查点提交；更新回复到达后清除旧候选。`rejected_result(state,protocol)` 拒绝未完成批次，兼容从旧 Chat 末尾的独立提交／匹配错误反馈重建候选。显式继续且模型配置兼容时，先以当前规则解析最后候选，即使工具定义已更新也允许恢复；成功记录 `result_recovered_from_call_id/result_recovered_on_schema_change` 并进入既有业务提交，保留原转录与用量。配置变化或候选无效且工具结构变化时才清除未完成协议并重建，不以旧结果替代新模型运行。原页版本、输入指纹、操作回执和租约仍逐层校验。
+
+`AIService.structured` 用 `model_validate(..., context={"rejections": []})` 接受结果。只有 `RevisionDraft` 的可选概念／关系使用该审计收集器逐条验证；必需操作和其他任务的 schema 仍严格。错误项写入阶段 `validation_rejections`；正文提交事务同步落 `relation_rejection` 并累计检查点 `enrichment:{concepts,relations,rejected}`。格式正确的增强数据仍按现有证据规则验证。新工具定义说明正文优先及可省略增强，升级时无完整可恢复候选的旧工具链会重建当前单元，已完成单元不重做。
+
+读取工具的参数或查无结果错误只计 `tool_errors` 和正常工具轮数，不消耗 `format_retries`。`tool_events` 记录最近工具名、轮数、耗时、状态与安全错误消息，按 `Settings.task_activity_history_size=12` 保存；此值不限制协议转录、执行轮数或并发。任务投影增加 `enrichment/tool_errors/tool_events`；请求活动增加 `tool_name/stream_phase/retry_limit/last_failure`。504 和本地等待超时分别报告，后续重试保留上次失败耗时。正文单元数与 OCR 阶段数分别展示。
 
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 

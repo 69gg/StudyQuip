@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import TypeAdapter
 
-from studyquip.ai import AIService, ModelProfile, split_legacy_model_roles
+from studyquip.ai import AIProtocolError, AIService, ModelProfile, split_legacy_model_roles
 from studyquip.api import create_app
 from studyquip.auth import set_password
 from studyquip.config import Settings
@@ -24,11 +24,161 @@ from studyquip.context import node_source_fingerprint
 from studyquip.db import ConflictError, Database, initialize, jobs_table
 from studyquip.jobs import JobStore
 from studyquip.media import store_upload
-from studyquip.pipelines import PipelineContext, QuestionDraft, RevisionDraft, question_text_fields
+from studyquip.pipelines import (
+    PipelineContext,
+    QuestionDraft,
+    RevisionDraft,
+    _revise_page,
+    question_text_fields,
+)
 from studyquip.progress import present_jobs
 from studyquip.retrieval import RetrievalService, records
 from studyquip.textbook import TextbookService
 from studyquip.worker import Worker
+
+
+@pytest.mark.asyncio
+async def test_revision_resume_salvages_body_and_audits_bad_enrichment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path)
+    initialize(settings)
+    db = Database(settings)
+    try:
+        book = db.put("book", {"title": "修订恢复样本", "asset_ids": []})
+        root = TextbookService(db).ensure_root(book["id"])
+        page = db.put(
+            "page", {"book_id": book["id"], "index": 0, "status": "draft", "text": "力能改变物体的运动状态。"}
+        )
+        configured = db.put(
+            "model",
+            ModelProfile(
+                role="book_text",
+                model="fixture",
+                base_url="https://fixture.invalid/v1",
+                api_key="fixture",
+                stream=False,
+                retries=0,
+            ).model_dump(exclude={"id", "revision"}),
+        )
+        evidence = {"block_id": "body", "revision": 1, "quote": page["text"]}
+        raw = {
+            "operations": [
+                {
+                    "op": "insert",
+                    "id": "body",
+                    "block": {
+                        "text": page["text"],
+                        "node_id": root["id"],
+                        "source_page_ids": {"item": page["id"]},
+                    },
+                }
+            ],
+            "reason": "保留正文",
+            "working_summary": "本页介绍力的作用。",
+            "concepts": [
+                {"id": "force", "name": "力", "evidence": [evidence]},
+                {"name": "错误概念", "aliases": {"unexpected": "不能猜补"}},
+            ],
+            "relations": [
+                {"evidence": evidence},
+                "force",
+                "body",
+                "described_by",
+                {
+                    "source_id": "force",
+                    "target_id": "body",
+                    "type": "described_by",
+                    "evidence": {"item": evidence},
+                },
+                {
+                    "source_id": "force",
+                    "target_id": root["id"],
+                    "type": "related",
+                    "evidence": {**evidence, "quote": "原文没有这句话"},
+                },
+            ],
+        }
+        calls = 0
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            wire = json.loads(request.content)
+            assert {tool["function"]["name"] for tool in wire["tools"]} == {"submit_result"}
+            assert "不把出版社、奖项" in wire["messages"][1]["content"][0]["text"]
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "saved",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "submit_result",
+                                            "arguments": json.dumps(raw, ensure_ascii=False),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 25},
+                },
+            )
+
+        ai = AIService(db, settings, transport=httpx.MockTransport(respond))
+        jobs = JobStore(db)
+        job = jobs.enqueue("book_process", book["id"])
+        claimed = jobs.claim("test-worker")
+        assert claimed
+        ctx = PipelineContext(db, jobs, ai, settings, claimed)
+        await ctx.bind("book")
+        validate = RevisionDraft.model_validate
+        schema = RevisionDraft.model_json_schema
+
+        def legacy_validate(value: Any, **kwargs: Any) -> RevisionDraft:
+            return validate(value)  # No independent enrichment collector in the old parser.
+
+        def legacy_schema(**kwargs: Any) -> dict[str, Any]:
+            return {**schema(**kwargs), "description": "旧版工具结构"}
+
+        with monkeypatch.context() as legacy:
+            legacy.setattr(RevisionDraft, "model_validate", legacy_validate)
+            legacy.setattr(RevisionDraft, "model_json_schema", legacy_schema)
+            with pytest.raises(AIProtocolError, match="已用完 0 次"):
+                await _revise_page(ctx, book, page, ModelProfile.model_validate(configured))
+        jobs.fail(*ctx.lease, "格式错误")
+        assert records(db, "block", {"book_id": book["id"]}) == []
+        jobs.resume(job["id"], 0)
+        continued = jobs.claim("replacement-worker")
+        assert continued
+        resumed = PipelineContext(db, jobs, ai, settings, continued)
+        await resumed.bind("book")
+        await _revise_page(resumed, book, page, await ai.profile_for("book_text"))
+        assert calls == 1  # Parser/tool upgrade revalidates the saved raw result without regenerating it.
+        assert db.get("page", page["id"])["status"] == "processed"
+        assert db.get("block", "body")["text"] == page["text"]
+        assert db.get("block", "body")["source_page_ids"] == [page["id"]]
+        assert len(records(db, "relation", {"book_id": book["id"]})) == 1
+        rejections = records(db, "relation_rejection", {"book_id": book["id"]})
+        assert len(rejections) == 6
+        assert any(row["reason"] == "normalized_quote_mismatch" for row in rejections)
+        projected = next(row for row in present_jobs(db) if row["id"] == job["id"])
+        assert projected["progress"]["enrichment"] == {"concepts": 1, "relations": 1, "rejected": 6}
+        assert projected["progress"]["completed_units"] == 1
+        stage = resumed.data["stages"][f"revise:{page['id']}:1:0:0"]
+        assert stage["result_recovered_from_call_id"] == "saved"
+        assert stage["result_recovered_on_schema_change"]
+        assert stage["request_context"]["tools"][0]["function"]["parameters"]["description"] == "旧版工具结构"
+        assert stage["usage"]["requests"] == 1 and len(stage["validation_rejections"]) == 5
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -365,7 +515,7 @@ async def test_resume_keeps_recognized_pages_and_full_unfinished_tool_history(
         if failure_kind == "legacy_array":
             validate = RevisionDraft.model_validate
 
-            def legacy_validate(value: Any) -> RevisionDraft:
+            def legacy_validate(value: Any, **kwargs: Any) -> RevisionDraft:
                 TypeAdapter(list[str]).validate_python(value["operations"][0]["block"]["source_page_ids"])
                 return validate(value)
 

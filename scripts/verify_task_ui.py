@@ -201,13 +201,93 @@ async def verify() -> dict[str, Any]:
                 page.get_by_text("后台已更新此页，已保留你的未保存内容。保存前请与最新草稿核对。", exact=True)
             ).to_be_visible()
             await expect(editor).to_have_value("用户正在校对，尚未保存。")
+            book_job["progress"].update(
+                {
+                    "phase": "顺序修订教材",
+                    "recognized_pages": 160,
+                    "processed_pages": 15,
+                    "current_page": 16,
+                    "blocks": 74,
+                    "review_pages": 0,
+                    "skipped_pages": 0,
+                    "completed_units": 15,
+                    "completed_stages": 175,
+                    "usage": {"requests": 176, "input_tokens": 267711, "output_tokens": 222437},
+                    "enrichment": {"concepts": 4, "relations": 1, "rejected": 6},
+                    "tool_errors": 2,
+                    "tool_events": [
+                        {
+                            "name": "submit_result",
+                            "round": 1,
+                            "page": 15,
+                            "at": now - 310,
+                            "duration_seconds": 0.03,
+                            "status": "completed",
+                        },
+                        {
+                            "name": "read_block",
+                            "round": 2,
+                            "page": 16,
+                            "at": now - 305,
+                            "duration_seconds": 0.02,
+                            "status": "error",
+                            "reason": "块不存在，请使用上下文中已有的正文块 ID。",
+                        },
+                    ],
+                }
+            )
             await page.goto("http://studyquip.test/#tasks?job=book_process")
             await expect(page.get_by_text("进度验收教材", exact=True)).to_be_visible()
-            await expect(page.get_by_text("原页 16 · vision-fixture", exact=False)).to_be_visible()
-            await expect(page.get_by_text("格式重试 1/2", exact=False)).to_be_visible()
+            await expect(page.locator(".request-detail").filter(has_text="vision-fixture")).to_contain_text(
+                "原页 16"
+            )
+            await expect(page.get_by_text("结果格式修复 1/2", exact=False)).to_be_visible()
             await expect(page.get_by_text("模型没有调用结构化结果工具", exact=False)).to_be_visible()
+            await expect(page.get_by_text("已完成正文单元 15", exact=False)).to_be_visible()
+            await expect(page.get_by_text("6 条概念或关系未通过校验", exact=False)).to_be_visible()
+            activity = book_job["progress"]["active_requests"][0]
+            activity.update(
+                {
+                    "state": "requesting",
+                    "streaming": True,
+                    "stream_phase": "arguments",
+                    "model": "text-fixture",
+                    "rounds": 2,
+                    "attempt": 3,
+                    "retry_limit": 2,
+                    "at": now - 40,
+                    "first_received_at": now - 20,
+                    "last_received_at": now,
+                    "received_events": 24,
+                    "reasoning_characters": 824,
+                    "tool_argument_characters": 512,
+                    "tool_names": ["submit_result"],
+                    "last_failure": {
+                        "status": 504,
+                        "reason": "上游网关超时（HTTP 504），本次等待 303 秒",
+                        "elapsed_seconds": 303,
+                        "timeout_seconds": 12000,
+                        "attempt": 2,
+                        "at": now - 45,
+                    },
+                }
+            )
+            await page.reload()
+            await expect(page.get_by_text("正在生成工具参数", exact=False)).to_be_visible()
+            await expect(page.get_by_text("网络重试 2/2", exact=False)).to_be_visible()
+            await expect(page.get_by_text("上游网关超时（HTTP 504）", exact=False)).to_be_visible()
+            await page.get_by_text("最近工具活动", exact=False).click()
+            await expect(
+                page.get_by_text("块不存在，请使用上下文中已有的正文块 ID。", exact=True)
+            ).to_be_visible()
+            await page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
             await page.screenshot(path=str(output / "tasks-mobile-dark.png"), full_page=True)
             assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            await page.set_viewport_size({"width": 1280, "height": 900})
+            await page.emulate_media(color_scheme="light")
+            await page.screenshot(path=str(output / "tasks-desktop-light.png"), full_page=True)
+            await page.emulate_media(color_scheme="dark")
+            await page.set_viewport_size({"width": 390, "height": 844})
             await page.goto("http://studyquip.test/#questions?question=question")
             await expect(page.get_by_role("button", name="题目处理中", exact=True)).to_be_disabled()
             await expect(page.get_by_role("button", name="已有处理任务", exact=True)).to_be_disabled()
@@ -316,6 +396,8 @@ async def verify() -> dict[str, Any]:
         "separate_model_purposes": list(MODEL_ROLE_LABELS),
         "question_formulas_and_review_notices": True,
         "format_retry_progress_and_settings": True,
+        "tool_history_gateway_diagnosis_and_stream_phase": True,
+        "body_units_separate_from_recognition": True,
         "mobile_overflow": False,
         "browser_errors": errors,
     }

@@ -126,6 +126,17 @@ export type Job = Entity & {
     };
     active_requests?: RequestActivity[];
     embedding_activity?: RequestActivity;
+    tool_errors?: number;
+    enrichment?: { concepts?: number; relations?: number; rejected?: number };
+    tool_events?: {
+      name: string;
+      round: number;
+      page?: number;
+      at: number;
+      duration_seconds: number;
+      status: string;
+      reason?: string;
+    }[];
   };
 };
 export type RequestActivity = {
@@ -137,10 +148,21 @@ export type RequestActivity = {
   page?: number;
   rounds?: number;
   attempt?: number;
+  retry_limit?: number;
+  last_failure?: {
+    status: number | string;
+    reason: string;
+    elapsed_seconds: number;
+    timeout_seconds: number;
+    attempt: number;
+    at: number;
+  };
   format_attempt?: number;
   format_limit?: number;
   reason?: string;
   streaming?: boolean;
+  stream_phase?: "thinking" | "arguments" | "content";
+  tool_name?: string;
   received_events?: number;
   first_received_at?: number;
   last_received_at?: number;

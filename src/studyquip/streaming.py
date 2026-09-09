@@ -48,6 +48,12 @@ class StreamProgress:
         self.value["output_characters"] += len(output)
         self.value["reasoning_characters"] += len(reasoning)
         self.value["tool_argument_characters"] += len(arguments)
+        if arguments or names:
+            self.value["stream_phase"] = "arguments"
+        elif output:
+            self.value["stream_phase"] = "content"
+        elif reasoning:
+            self.value["stream_phase"] = "thinking"
         self.value["tool_names"] = list(dict.fromkeys([*self.value["tool_names"], *(names or [])]))
         if self.callback and (force or now - self.last_saved >= self.interval):
             self.last_saved = now

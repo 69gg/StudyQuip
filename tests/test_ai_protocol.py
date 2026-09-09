@@ -39,6 +39,132 @@ class Result(BaseModel):
     answer: str
 
 
+def tool_response(protocol: str, index: int, name: str, arguments: dict[str, Any]) -> httpx.Response:
+    encoded = json.dumps(arguments, ensure_ascii=False)
+    if protocol == "chat":
+        body: dict[str, Any] = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": f"private-reasoning-{index}",
+                        "tool_calls": [
+                            {
+                                "id": f"call-{index}",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": encoded,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    else:
+        body = {
+            "id": f"response-{index}",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": f"reason-{index}", "summary": [], "encrypted_content": "opaque"},
+                {
+                    "type": "function_call",
+                    "id": f"item-{index}",
+                    "call_id": f"call-{index}",
+                    "name": name,
+                    "arguments": encoded,
+                    "status": "completed",
+                },
+            ],
+        }
+    body["usage"] = {"input_tokens": 10, "output_tokens": 20}
+    return httpx.Response(200, json=body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol,store", [("chat", False), ("responses", False), ("responses", True)])
+async def test_lookup_errors_leave_final_result_repair_available(
+    protocol: str, store: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studyquip.ai.retry_delay", lambda attempt: 0)
+    configured = profile(protocol=protocol, store=store, retries=1, max_tool_rounds=3)
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        requests.append(wire)
+        index = len(requests)
+        if index <= 2:
+            return tool_response(protocol, index, "read_block", {"block_id": "missing"})
+        if index == 4:
+            history = wire["messages" if protocol == "chat" else "input"]
+            feedback = history[-1]
+            assert feedback.get("tool_call_id", feedback.get("call_id")) == "call-3"
+            assert "answer" in feedback.get("content", feedback.get("output"))
+        return tool_response(protocol, index, "submit_result", {} if index == 3 else {"answer": "完整正文"})
+
+    async def read(arguments: dict[str, Any]) -> None:
+        raise ValueError("块不存在或超出允许范围")
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {}
+    result = await ai.structured(
+        configured,
+        "整理本页",
+        Result,
+        state=state,
+        tools={
+            "read_block": (
+                "读取正文",
+                {"type": "object", "properties": {"block_id": {"type": "string"}}},
+                read,
+            )
+        },
+    )
+    assert result.answer == "完整正文" and len(requests) == 4
+    assert state["format_retries"] == 1 and state["tool_errors"] == 2
+    assert [event["status"] for event in state["tool_events"]] == ["error", "error", "error", "completed"]
+    assert "private-reasoning" not in json.dumps(state["tool_events"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_gateway_retry_diagnosis_is_persisted_and_does_not_accept_failed_response(
+    recover: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studyquip.ai.retry_delay", lambda attempt: 0)
+    configured = profile(timeout_seconds=12000, retries=2)
+    attempts = 0
+    snapshots: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if recover and attempts == 3:
+            return tool_response("chat", attempts, "submit_result", {"answer": "完成"})
+        return httpx.Response(504, json={"error": {"message": "openai_error"}}, headers={"Retry-After": "0"})
+
+    async def save(value: dict[str, Any]) -> None:
+        snapshots.append(copy.deepcopy(value))
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {}
+    if recover:
+        assert (await ai.structured(configured, "正文", Result, state=state, save=save)).answer == "完成"
+    else:
+        with pytest.raises(AIProtocolError, match=r"上游网关超时.*已重试 2/2.*12000 秒"):
+            await ai.structured(configured, "正文", Result, state=state, save=save)
+        assert "result" not in state and state["activity"]["state"] == "failed"
+    assert attempts == 3
+    failures = [s["activity"] for s in snapshots if s.get("activity", {}).get("last_failure")]
+    assert {item["last_failure"]["status"] for item in failures} == {504}
+    assert failures[-1]["last_failure"]["timeout_seconds"] == 12000
+    assert failures[-1]["retry_limit"] == 2
+    assert "fixture-key" not in json.dumps(failures)
+
+
 def profile(**values: Any) -> ModelProfile:
     values.setdefault("stream", False)  # Non-stream protocol fixtures; SSE is tested separately.
     return ModelProfile(
@@ -566,7 +692,10 @@ async def test_format_retries_preserve_protocol_feedback_and_window_checkpoint(
     feedback = wire_history[-1]
     assert feedback.get("tool_call_id", feedback.get("call_id")) == "call-2"
     detail = feedback.get("content", feedback.get("output"))
-    assert "source_page_ids" in detail and "aliases" in detail and "evidence" in detail
+    assert "source_page_ids" in detail
+    assert (
+        "aliases" not in detail and "concepts" not in detail
+    )  # Optional enrichment no longer blocks repair.
     assert "UpdateOperation" not in detail and "errors.pydantic.dev" not in detail
     if protocol == "chat":
         assert any(item.get("reasoning_content") == "thinking-1" for item in wire_history)
@@ -700,7 +829,7 @@ async def test_resume_revalidates_saved_result_without_another_model_call(
     state: dict[str, Any] = {}
     validate = RevisionDraft.model_validate
 
-    def legacy_validate(value: Any) -> RevisionDraft:
+    def legacy_validate(value: Any, **kwargs: Any) -> RevisionDraft:
         # Reproduce the old list[str] validator without changing the wire schema.
         TypeAdapter(list[str]).validate_python(value["operations"][0]["block"]["source_page_ids"])
         return validate(value)
