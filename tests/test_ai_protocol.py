@@ -1017,9 +1017,19 @@ async def test_waiting_request_reloads_capacity_without_releasing_existing_slot(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol,store", [("chat", False), ("responses", False), ("responses", True)])
+@pytest.mark.parametrize(
+    "protocol,store,role_mode",
+    [
+        ("chat", False, "first"),
+        ("chat", False, "every"),
+        ("chat", False, "late"),
+        ("chat", False, "omitted"),
+        ("responses", False, "first"),
+        ("responses", True, "first"),
+    ],
+)
 async def test_streaming_tools_preserve_complete_protocol_and_observe_deltas(
-    protocol: str, store: bool
+    protocol: str, store: bool, role_mode: str
 ) -> None:
     configured = profile(protocol=protocol, store=store, stream=True, retries=0)
     wires: list[dict[str, Any]] = []
@@ -1042,21 +1052,36 @@ async def test_streaming_tools_preserve_complete_protocol_and_observe_deltas(
                 "model": "fixture-model",
             }
             deltas = [
-                {"role": "assistant", "reasoning_content": "先读"},
-                {"reasoning_content": "依据"},
+                {"reasoning_content": "先读", "content": "重复"},
+                {"reasoning_content": "先读", "content": "重复"},
                 {
                     "tool_calls": [
                         {
                             "index": 0,
-                            "id": f"call-{number}",
+                            "id": "call-",
                             "type": "function",
-                            "function": {"name": name, "arguments": arguments[:6]},
+                            "function": {"name": name[:2], "arguments": arguments[:6]},
                         }
                     ]
                 },
-                {"tool_calls": [{"index": 0, "function": {"arguments": arguments[6:]}}]},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": str(number),
+                            "function": {"name": name[2:], "arguments": arguments[6:]},
+                        }
+                    ]
+                },
                 {},
             ]
+            for index, delta in enumerate(deltas):
+                if (
+                    role_mode == "every"
+                    or (role_mode == "first" and index == 0)
+                    or (role_mode == "late" and index == 1)
+                ):
+                    delta["role"] = "assistant"
             events = [
                 {
                     **base,
@@ -1146,7 +1171,18 @@ async def test_streaming_tools_preserve_complete_protocol_and_observe_deltas(
     assert any(item.get("tool_argument_characters", 0) >= len('{"id":"block"}') for item in observed)
     assert any(item.get("last_received_at") for item in observed)
     if protocol == "chat":
-        assert wires[1]["messages"][2]["reasoning_content"] == "先读依据"
+        assert [message["role"] for message in wires[1]["messages"]] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert wires[1]["messages"][2]["reasoning_content"] == "先读先读"
+        assert wires[1]["messages"][2]["content"] == "重复重复"
+        assert wires[1]["messages"][2]["tool_calls"][0]["function"] == {
+            "name": "read",
+            "arguments": '{"id":"block"}',
+        }
         assert wires[1]["messages"][3]["tool_call_id"] == "call-1"
     elif store:
         assert wires[1]["input"][1:3] == [
@@ -1156,6 +1192,112 @@ async def test_streaming_tools_preserve_complete_protocol_and_observe_deltas(
     else:
         assert wires[1]["input"][1]["encrypted_content"] == "opaque-encrypted"
         assert wires[1]["input"][2]["arguments"] == '{"id":"block"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role,pending,valid",
+    [
+        ("assistant" * 300, False, True),
+        ("assistant" * 300, True, True),
+        ("assistantsystem", True, False),
+        (None, True, False),
+    ],
+)
+async def test_chat_resume_repairs_known_roles_without_repeating_saved_tools(
+    role: str | None, pending: bool, valid: bool
+) -> None:
+    configured = profile(retries=2)
+    message = tool_response("chat", 1, "read", {"id": "block"}).json()["choices"][0]["message"]
+    message["content"] = "assistantassistant 也是原文，不应修改"
+    output = {"role": "tool", "tool_call_id": "call-1", "content": '{"text": "已读取原文"}'}
+    expected = [copy.deepcopy(message), output]
+    message["role"] = role
+    requests: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    reads: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        wire = json.loads(request.content)
+        requests.append(wire)
+        assert wire["messages"][2:] == expected
+        assert snapshots[-1]["transcript"][0]["role"] == "assistant"
+        return tool_response("chat", 2, "submit_result", {"answer": "续接完成"})
+
+    async def read(arguments: dict[str, Any]) -> dict[str, str]:
+        reads.append(arguments)
+        return {"text": "已读取原文"}
+
+    async def save(value: dict[str, Any]) -> None:
+        snapshots.append(copy.deepcopy(value))
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    state: dict[str, Any] = {
+        "binding": ai.binding(configured),
+        "transcript": [message] if pending else [message, copy.deepcopy(output)],
+        "pending": [{"call_id": "call-1", "name": "read", "arguments": '{"id":"block"}'}] if pending else [],
+        "rounds": 1,
+        "usage": {"requests": 1, "input_tokens": 10, "output_tokens": 20},
+    }
+    original = copy.deepcopy(state)
+    call = ai.structured(
+        configured,
+        "当前页",
+        Result,
+        state=state,
+        save=save,
+        tools={"read": ("读取原文", {"type": "object", "properties": {}}, read)},
+    )
+    if not valid:
+        with pytest.raises(AIProtocolError, match="role 不合法"):
+            await call
+        assert not requests and not reads
+        assert state == original
+        return
+    assert (await call).answer == "续接完成"
+    assert len(requests) == 1 and len(reads) == int(pending)
+    assert state["chat_role_repairs"] == 1
+    assert state["transcript"][:2] == expected
+    assert state["usage"] == {"requests": 2, "input_tokens": 20, "output_tokens": 40}
+    assert not state.get("configuration_restarts") and not state.get("format_retries")
+    assert (await ai.structured(configured, "当前页", Result, state=state)).answer == "续接完成"
+    assert len(requests) == 1 and state["chat_role_repairs"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_unexpected_response_role_stops_before_tool_execution(stream: bool) -> None:
+    configured = profile(stream=stream, retries=2)
+    requests = 0
+    state: dict[str, Any] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        body = tool_response("chat", 1, "submit_result", {"answer": "不能接受"}).json()
+        message = body["choices"][0]["message"]
+        message["role"] = "system"
+        if not stream:
+            return httpx.Response(200, json=body)
+        message["tool_calls"][0]["index"] = 0
+        chunk = {
+            "id": "fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture",
+            "choices": [{"index": 0, "delta": message, "finish_reason": "tool_calls"}],
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n",
+        )
+
+    ai = AIService(FakeProfiles([configured]), Settings(), transport=httpx.MockTransport(respond))
+    with pytest.raises(AIProtocolError, match="role 必须为 assistant"):
+        await ai.structured(configured, "当前页", Result, state=state)
+    assert requests == 1 and "result" not in state
+    assert not state.get("transcript") and not state.get("pending")
 
 
 @pytest.mark.asyncio

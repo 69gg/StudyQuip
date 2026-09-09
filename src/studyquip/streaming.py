@@ -17,6 +17,10 @@ class StreamInterrupted(RuntimeError):
     """The provider closed a stream before its terminal response."""
 
 
+class StreamProtocolError(StreamInterrupted):
+    """Invalid stream metadata cannot be repaired by retrying the same request."""
+
+
 class StreamProgress:
     def __init__(self, callback: Progress | None, interval: float) -> None:
         self.callback, self.interval = callback, interval
@@ -72,7 +76,14 @@ async def stream_response(
         async with stream:
             async for chunk in stream:
                 received = True
+                if any(choice.delta.role not in (None, "assistant") for choice in chunk.choices):
+                    raise StreamProtocolError("Chat 流式响应的 role 必须为 assistant，未保存异常响应")
                 list(accumulator.handle_chunk(chunk))
+                # The SDK concatenates every string, including repeated role
+                # metadata from compatible providers. Restore this enum after
+                # each chunk; actual text, reasoning and tool fragments stay intact.
+                for choice in accumulator.current_completion_snapshot.choices:
+                    choice.message.role = "assistant"
                 deltas = [choice.delta.model_dump(exclude_none=True) for choice in chunk.choices]
                 calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
                 await progress.update(

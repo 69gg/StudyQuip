@@ -158,6 +158,10 @@ worker 启动且尚未认领任务时，`JobStore.restore_review_pages()` 扫描
 
 `streaming.py` 使用锁定 OpenAI SDK 的 Chat delta 累积器，保留供应商推理字段与工具参数；Responses 使用 completed／incomplete 事件的完整 response，包含 encrypted reasoning、call_id 与所有输出项，后续按原有 store 模式续接。未收到终态／Chat finish_reason 的断流按网络错误重试。只在完整响应后校验与接受业务结果，不能提交半段 JSON。`StreamProgress` 默认每秒至多持久化一次观测，首事件与结束事件刷新；包含事件数、首末接收时间及三类字符计数，不保存 delta 内容到前端投影。字符数不是 token 数，使用量以服务商完整 usage 为准；断流产生的费用可能没有 usage 回报。
 
+Chat 的 `role` 是枚举元数据，不是需要拼接的文本。兼容服务商可能每个分片都重复发送 `assistant`；应用在逐个分片累积后立即将助手快照的角色固定为 `assistant`，也接受角色延后出现或省略的分片。显式返回其他角色则按 `StreamProtocolError` 停止，不将其改作助手、执行工具或重复请求；非流式完整回复同样要求 `assistant`。正文、思考字段、工具名称／ID／参数仍按 SDK 的增量规则保留，不通过通用字符串去重处理真实重复文字或合法分片。[Chat 流式字段与助手消息定义](https://developers.openai.com/api/reference/resources/chat/subresources/completions)
+
+恢复旧 Chat 工具链时，`repair_chat_roles` 只将由完整 `assistant` 重复组成的错误角色修复为单个 `assistant`；其他未知或缺失角色在本地报错，不再原样发送而触发上游 400。全部历史角色校验通过才修复，阶段记录累计 `chat_role_repairs`，通过已有检查点保存回调持久化。仅改角色，不修改正文、推理、工具参数、调用 ID、工具结果或用量；已完成的工具不重做，剩余 `pending` 正常续接。配置／工具结构变化仍遵守原有重建与结果复验协议，Responses 的存储与加密项处理不变。修复无需迁移或清库，由用户启动新版 worker 后继续原任务时执行；HTTP 400 仍不作网络重试。
+
 音频用途分别调用 `audio.transcriptions.create`（multipart file、model、JSON response_format、可选 language）与 `audio.speech.create`（model、input、voice、MP3 response_format、可选 speed）。`voice` 无隐含服务商音色，合成模型必须显式设置；扩展 JSON 不能覆盖专用输入字段。SDK 自动重试关闭，共用 worker、窗口、两级并发、网络重试和在途续租。服务商自己的音频长度／上传限制仍适用；不会偷偷换模型或生成空音频假装成功。
 
 `question_audio` 与题目整理／讲解互斥，逐材料存 `audio_results[material_id]` 检查点。ASR 文稿或 TTS 附件发布受租约检查保护；所有缺失项完成或剩余项缺少配置后，整体写入题目新版本。中途失败时，已有阶段在检查点中保留，下次继续跳过，剩余项读取最新配置；题目已被用户修改则拒绝旧任务提交。TTS 保存来源文稿 SHA-256，改文稿后可识别合成音频过期，不替换用户上传的原录音。没有音频模型时保留材料，结果返回缺少的用途。连接测试用短合成文本／一秒静音 WAV，仅验证音频接口，不代表识别质量通过。

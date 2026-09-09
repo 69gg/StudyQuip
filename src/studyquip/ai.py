@@ -8,15 +8,17 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import time
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
 from zoneinfo import ZoneInfo
 
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+from openai.types.chat import ChatCompletionRole
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from studyquip.scheduling import (
@@ -28,7 +30,7 @@ from studyquip.scheduling import (
     parse_retry_after,
     retry_delay,
 )
-from studyquip.streaming import StreamInterrupted, StreamProgress, stream_response
+from studyquip.streaming import StreamInterrupted, StreamProgress, StreamProtocolError, stream_response
 
 if TYPE_CHECKING:
     from studyquip.db import Database
@@ -207,6 +209,23 @@ class AIProtocolError(RuntimeError):
 
 class ContextBudgetExceeded(AIProtocolError):
     pass
+
+
+def repair_chat_roles(transcript: list[Json]) -> int:
+    """Repair only the known enum-concatenation bug, keeping every other field."""
+    repairs: list[Json] = []
+    for index, message in enumerate(transcript):
+        role = message.get("role")
+        if isinstance(role, str) and re.fullmatch(r"(?:assistant){2,}", role):
+            repairs.append(message)
+        elif role not in get_args(ChatCompletionRole):
+            raise AIProtocolError(
+                f"Chat 续接记录第 {index + 1} 条消息的 role 不合法，未发送模型请求；"
+                "仅能自动修复重复的 assistant，不能猜测其他角色。"
+            )
+    for message in repairs:
+        message["role"] = "assistant"
+    return len(repairs)
 
 
 def validation_feedback(error: Exception) -> str:
@@ -525,14 +544,18 @@ class AIService:
                 httpx.TransportError,
                 StreamInterrupted,
             ) as error:
-                transient = (
+                transient = not isinstance(error, StreamProtocolError) and (
                     not isinstance(error, APIStatusError)
                     or error.status_code in {408, 409, 429}
                     or error.status_code >= 500
                 )
                 # Retain a safe, useful diagnosis even while the next attempt is
                 # in flight. No headers, input, response body or credentials.
-                status = getattr(error, "status_code", "network")
+                status = (
+                    "protocol"
+                    if isinstance(error, StreamProtocolError)
+                    else getattr(error, "status_code", "network")
+                )
                 body = getattr(error, "body", None)
                 if isinstance(body, dict) and isinstance(body.get("error"), dict):
                     body = body["error"]
@@ -668,6 +691,12 @@ class AIService:
         async def persist() -> None:
             if save:
                 await save(state)
+
+        if profile.protocol == "chat":
+            repaired = repair_chat_roles(transcript)
+            if repaired:
+                state["chat_role_repairs"] = state.get("chat_role_repairs", 0) + repaired
+                await persist()
 
         image_hashes = [hashlib.sha256(url.encode()).hexdigest() for url in images or []]
         if "request_context" not in state:
@@ -887,6 +916,9 @@ class AIService:
                     await persist()
                     continue
                 message = choices[0]["message"]
+                if message.get("role") != "assistant":
+                    await persist()
+                    raise AIProtocolError("Chat 响应的 role 必须为 assistant，未保存异常响应")
                 if choices[0].get("finish_reason") == "length":
                     await persist()
                     raise AIProtocolError("模型输出被截断；请提高输出预算或缩小处理单元")

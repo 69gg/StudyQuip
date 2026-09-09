@@ -28,6 +28,8 @@
 
 读取工具的参数或查无结果错误只计 `tool_errors` 和正常工具轮数，不消耗 `format_retries`。`tool_events` 记录最近工具名、轮数、耗时、状态与安全错误消息，按 `Settings.task_activity_history_size=12` 保存；此值不限制协议转录、执行轮数或并发。任务投影增加 `enrichment/tool_errors/tool_events`；请求活动增加 `tool_name/stream_phase/retry_limit/last_failure`。504 和本地等待超时分别报告，后续重试保留上次失败耗时。正文单元数与 OCR 阶段数分别展示。
 
+Chat 流式累积将 `role` 作为枚举元数据处理，重复／延后／省略 `assistant` 不会生成重复角色字符串。显式非助手角色触发 `StreamProtocolError`，请求活动失败状态为 `protocol`，不作网络重试；完整普通回复也拒绝非助手角色。`repair_chat_roles(transcript)->int` 在恢复链执行待处理工具前校验全部消息角色，只修复完整重复的 `assistant`，返回修复条数并累加阶段 `chat_role_repairs`，随已有检查点保存。其他协议字段、已完成工具、剩余 `pending` 和用量保留；没有批量修改数据库或新增迁移。
+
 模型阶段新增 `request_context:{system,prompt,image_hashes,tools}` 保存初始输入，完整转录与逐个工具结果继续保存在同一阶段。恢复时先读最新模型，配置指纹或工具定义变化则重建未完成工具链并清除此输入快照，保留累计用量与已完成结果。兼容旧检查点：缺少该字段时只补建初始输入，配置相同的 `transcript/pending/rounds/usage` 仍复用。图片按指纹验证，Base64 不在检查点重复保存。教材 `revision_plans[page_id:revision]` 仅继续使用 `unit_budget` 固定已划分的边界（`null` 表示整页）；旧 `context_budget` 不再约束恢复，总预算使用最新模型值。
 
 `ai.ModelRole` 为 `book_vision|book_text|question_vision|question_text|embedding|speech_recognition|speech_synthesis`。`AIService.profile_for(role=None,explicit_id=None)` 必须指定用途或 ID；连接测试使用 ID，其余生成按用途读取。教材草稿用 `book_vision`，修订、概述和建议用 `book_text`；题目有题图或参考图时用 `question_vision`，纯文字提取及讲解用 `question_text`；索引及查询向量共用 `embedding`。当前 API 新增配置默认 `question_text`，不再接受旧用途作为新配置。
